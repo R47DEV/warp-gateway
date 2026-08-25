@@ -33,6 +33,7 @@ sleep 1
 
 # 1. Dependency & Package Installation
 log_info "Updating system packages and installing required dependencies..."
+export DEBIAN_FRONTEND=noninteractive
 apt update -y || { log_warn "Apt update failed, attempting automatic fix..."; apt update --fix-missing -y; }
 
 apt install -y curl gnupg lsb-release iptables python3 python3-pip iptables-persistent net-tools bsdextrautils bsdmainutils || {
@@ -93,14 +94,24 @@ mkdir -p /opt/warpgateway
 echo -e "${YELLOW}---------------------------------------------------${NC}"
 echo -e "${YELLOW}   Dashboard Admin Credentials Setup               ${NC}"
 echo -e "${YELLOW}---------------------------------------------------${NC}"
-read -p "Enter Admin Username [Default: admin]: " INPUT_USER
-UI_USER=${INPUT_USER:-admin}
 
-read -sp "Enter Admin Password [Default: admin123]: " INPUT_PASS
-echo ""
-UI_PASS=${INPUT_PASS:-admin123}
+# Generate Secure Random Fallback Credentials
+RANDOM_USER="admin_$(head -c 4 /dev/urandom | hexdump -e '4/1 "%02x"')"
+RANDOM_PASS="$(head -c 8 /dev/urandom | hexdump -e '8/1 "%02x"')"
 
-# Generating random secret key safely
+if [ -t 0 ]; then
+    read -p "Enter Admin Username [Default: ${RANDOM_USER}]: " INPUT_USER
+    UI_USER=${INPUT_USER:-$RANDOM_USER}
+
+    read -sp "Enter Admin Password [Default: ${RANDOM_PASS}]: " INPUT_PASS
+    echo ""
+    UI_PASS=${INPUT_PASS:-$RANDOM_PASS}
+else
+    log_warn "Non-interactive shell detected. Generated secure random credentials."
+    UI_USER=$RANDOM_USER
+    UI_PASS=$RANDOM_PASS
+fi
+
 GEN_KEY=$(head -c 16 /dev/urandom | hexdump -e '16/1 "%02x"' 2>/dev/null || echo "warp_default_secret_key_99")
 
 cat << EOF > /opt/warpgateway/config.py
@@ -286,5 +297,5 @@ echo -e "${GREEN}      Installation Completed Successfully!        ${NC}"
 echo -e "${GREEN}===================================================${NC}"
 echo -e "${BLUE}Dashboard URL:${NC} http://${IP_ADDR}:8080"
 echo -e "${BLUE}Username:${NC} ${UI_USER}"
-echo -e "${BLUE}Password:${NC} (Password configured during setup)"
+echo -e "${BLUE}Password:${NC} ${UI_PASS}"
 echo -e "${GREEN}===================================================${NC}"
