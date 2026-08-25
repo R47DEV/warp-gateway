@@ -193,10 +193,12 @@ def get_throughput_nonblocking(iface):
 
 
 # ---------------------------------------------------------------------------
-# Connected LAN devices + per-IP active connection counts
+# Connected LAN devices + per-IP active connections and traffic volume
 # ---------------------------------------------------------------------------
 def get_lan_clients():
-    """LAN devices from the ARP table: [{ip, mac}, ...]."""
+    """LAN devices from the ARP table: [{ip, mac}, ...]. This is the
+    definitive 'how many devices are connected' count — one ARP entry per
+    device that has talked to the gateway recently."""
     arp_out = run_cmd("arp -a")
     devices = []
     for line in arp_out.splitlines():
@@ -206,28 +208,53 @@ def get_lan_clients():
     return devices
 
 
-def get_connection_counts():
-    """Active connection count per source IP, via conntrack. Requires the
-    `conntrack` package — returns {} silently if it isn't installed."""
+def get_connection_stats():
+    """Per-source-IP live stats from conntrack: active connection count plus
+    tracked bytes in each direction. Each conntrack line has two src=/dst=
+    pairs — the first is the original direction (LAN client -> internet,
+    i.e. upload) and the second is the reply direction (internet -> LAN
+    client, i.e. download), each with its own bytes= counter.
+
+    Requires the `conntrack` package — returns {} silently if missing.
+    Note: these byte counts only cover connections CURRENTLY in the
+    conntrack table (recent/active), not all-time historical usage per
+    device — conntrack isn't a persistent traffic accountant like vnstat.
+    """
     out = run_cmd("conntrack -L -n 2>/dev/null")
-    counts = {}
+    stats = {}
     for line in out.splitlines():
-        m = re.search(r"\bsrc=(\d+\.\d+\.\d+\.\d+)", line)
-        if m:
-            ip = m.group(1)
-            counts[ip] = counts.get(ip, 0) + 1
-    return counts
+        srcs = re.findall(r"\bsrc=(\d+\.\d+\.\d+\.\d+)", line)
+        byte_counts = re.findall(r"\bbytes=(\d+)", line)
+        if not srcs:
+            continue
+        client_ip = srcs[0]
+        entry = stats.setdefault(client_ip, {"connections": 0, "tx_bytes": 0, "rx_bytes": 0})
+        entry["connections"] += 1
+        if len(byte_counts) >= 1:
+            entry["tx_bytes"] += int(byte_counts[0])   # client -> internet
+        if len(byte_counts) >= 2:
+            entry["rx_bytes"] += int(byte_counts[1])   # internet -> client
+
+
+    return stats
 
 
 def get_connected_devices():
     """Merge ARP-known LAN devices with their live conntrack connection
-    counts, sorted busiest-first."""
+    count + tracked upload/download bytes, sorted busiest-first (by total
+    bytes, so the heaviest user of the network floats to the top)."""
     devices = get_lan_clients()
-    counts = get_connection_counts()
+    stats = get_connection_stats()
     for d in devices:
-        d["connections"] = counts.get(d["ip"], 0)
-    devices.sort(key=lambda d: d["connections"], reverse=True)
+        s = stats.get(d["ip"], {"connections": 0, "tx_bytes": 0, "rx_bytes": 0})
+        d["connections"] = s["connections"]
+        d["tx_bytes"] = s["tx_bytes"]
+        d["rx_bytes"] = s["rx_bytes"]
+        d["total_bytes"] = s["tx_bytes"] + s["rx_bytes"]
+    devices.sort(key=lambda d: d["total_bytes"], reverse=True)
     return devices
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -549,12 +576,14 @@ def render_device_rows(devices):
     initial server-rendered page and the JSON API (so both use identical
     formatting logic — the JS just calls this row shape too)."""
     if not devices:
-        return '<tr><td colspan="3" style="padding:10px 0;color:var(--muted);">No devices found in the ARP table yet.</td></tr>'
+        return '<tr><td colspan="5" style="padding:10px 0;color:var(--muted);">No devices found in the ARP table yet.</td></tr>'
     rows = []
     for d in devices:
         rows.append(
             f'<tr><td style="padding:8px 0;border-bottom:1px solid var(--border);">{d["ip"]}</td>'
             f'<td style="padding:8px 0;border-bottom:1px solid var(--border);color:var(--muted);font-size:12px;">{d["mac"]}</td>'
+            f'<td style="padding:8px 0;border-bottom:1px solid var(--border);text-align:right;">{humanize_bytes(d.get("rx_bytes", 0))}</td>'
+            f'<td style="padding:8px 0;border-bottom:1px solid var(--border);text-align:right;">{humanize_bytes(d.get("tx_bytes", 0))}</td>'
             f'<td style="padding:8px 0;border-bottom:1px solid var(--border);text-align:right;font-weight:600;">{d["connections"]}</td></tr>'
         )
     return "".join(rows)
@@ -678,12 +707,14 @@ def dashboard():
 
     <div class="card">
       <h3>{icon('server')} Connected Devices <span class="badge mode" id="device-count-badge" style="margin-left:6px;">{len(devices)} devices</span></h3>
-      <p style="color:var(--muted);font-size:12px;margin-bottom:10px;">IP and MAC from the ARP table; active connection count per IP from conntrack (requires the <code style="background:var(--panel-2);padding:1px 6px;border-radius:5px;">conntrack</code> package).</p>
+      <p style="color:var(--muted);font-size:12px;margin-bottom:10px;">IP and MAC from the ARP table. Download/Upload and connection count are live figures from <code style="background:var(--panel-2);padding:1px 6px;border-radius:5px;">conntrack</code> (requires that package) — they reflect traffic on currently-active connections, not lifetime totals per device.</p>
       <table style="width:100%;border-collapse:collapse;font-size:13px;">
         <thead>
           <tr style="text-align:left;color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;">
             <th style="padding-bottom:8px;">IP Address</th>
             <th style="padding-bottom:8px;">MAC Address</th>
+            <th style="padding-bottom:8px;text-align:right;">Download</th>
+            <th style="padding-bottom:8px;text-align:right;">Upload</th>
             <th style="padding-bottom:8px;text-align:right;">Active Connections</th>
           </tr>
         </thead>
