@@ -35,7 +35,7 @@ sleep 1
 log_info "Updating system packages and installing required dependencies..."
 apt update -y || { log_warn "Apt update failed, attempting automatic fix..."; apt update --fix-missing -y; }
 
-apt install -y curl gnupg lsb-release iptables python3 python3-pip iptables-persistent net-tools || {
+apt install -y curl gnupg lsb-release iptables python3 python3-pip iptables-persistent net-tools bsdextrautils bsdmainutils || {
     log_error "Failed to install required dependencies."
     exit 1
 }
@@ -93,20 +93,23 @@ mkdir -p /opt/warpgateway
 echo -e "${YELLOW}---------------------------------------------------${NC}"
 echo -e "${YELLOW}   Dashboard Admin Credentials Setup               ${NC}"
 echo -e "${YELLOW}---------------------------------------------------${NC}"
-read -p "Enter Admin Username [Default: admin]: " UI_USER
-UI_USER=${UI_USER:-admin}
+read -p "Enter Admin Username [Default: admin]: " INPUT_USER
+UI_USER=${INPUT_USER:-admin}
 
-read -sp "Enter Admin Password [Default: admin123]: " UI_PASS
+read -sp "Enter Admin Password [Default: admin123]: " INPUT_PASS
 echo ""
-UI_PASS=${UI_PASS:-admin123}
+UI_PASS=${INPUT_PASS:-admin123}
+
+# Generating random secret key safely
+GEN_KEY=$(head -c 16 /dev/urandom | hexdump -e '16/1 "%02x"' 2>/dev/null || echo "warp_default_secret_key_99")
 
 cat << EOF > /opt/warpgateway/config.py
 ADMIN_USER = "${UI_USER}"
 ADMIN_PASS = "${UI_PASS}"
-SECRET_KEY = "$(head -c 16 /dev/urandom | hexxdump -e '16/1 "%02x"')"
+SECRET_KEY = "${GEN_KEY}"
 EOF
 
-# Create Application Source Code (Quotes around 'EOF' prevent Bash syntax errors)
+# Create Application Source Code
 cat << 'EOF' > /opt/warpgateway/app.py
 import subprocess
 import os
