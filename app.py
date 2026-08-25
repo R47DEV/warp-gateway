@@ -5,7 +5,7 @@ import re
 import threading
 import time
 from functools import wraps
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
 from markupsafe import Markup
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -153,7 +153,8 @@ def humanize_bytes(n):
 
 def get_throughput(iface, sample_seconds=1.0):
     """Instantaneous download/upload rate in bytes/sec, measured by sampling
-    /proc/net/dev twice with a short delay in between."""
+    /proc/net/dev twice with a short delay in between. Blocks for
+    `sample_seconds` — only used for the very first page paint."""
     if not iface:
         return 0, 0
     rx1, tx1 = get_iface_bytes(iface)
@@ -162,6 +163,71 @@ def get_throughput(iface, sample_seconds=1.0):
     rx_rate = max(0, (rx2 - rx1) / sample_seconds)
     tx_rate = max(0, (tx2 - tx1) / sample_seconds)
     return rx_rate, tx_rate
+
+
+# Rolling sample used by the polling API so the browser can refresh throughput
+# every couple of seconds WITHOUT the server blocking/sleeping on every call.
+# Each call just diffs against whatever was measured on the previous call.
+_net_sample_lock = threading.Lock()
+_last_net_sample = {"ts": None, "rx": None, "tx": None, "iface": None}
+
+
+def get_throughput_nonblocking(iface):
+    """Non-blocking version of get_throughput(). Returns
+    (rx_rate, tx_rate, rx_total, tx_total). The rate is 0 on the very first
+    call (no prior sample to diff against) and becomes accurate from the
+    second call onward — perfect for a JS poll loop."""
+    global _last_net_sample
+    rx_now, tx_now = get_iface_bytes(iface)
+    now = time.time()
+    with _net_sample_lock:
+        prev = _last_net_sample
+        if prev["ts"] is not None and prev["iface"] == iface and now > prev["ts"]:
+            dt = now - prev["ts"]
+            rx_rate = max(0, (rx_now - prev["rx"]) / dt)
+            tx_rate = max(0, (tx_now - prev["tx"]) / dt)
+        else:
+            rx_rate = tx_rate = 0
+        _last_net_sample = {"ts": now, "rx": rx_now, "tx": tx_now, "iface": iface}
+    return rx_rate, tx_rate, rx_now, tx_now
+
+
+# ---------------------------------------------------------------------------
+# Connected LAN devices + per-IP active connection counts
+# ---------------------------------------------------------------------------
+def get_lan_clients():
+    """LAN devices from the ARP table: [{ip, mac}, ...]."""
+    arp_out = run_cmd("arp -a")
+    devices = []
+    for line in arp_out.splitlines():
+        m = re.search(r"\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([0-9a-fA-F:]{17})", line)
+        if m:
+            devices.append({"ip": m.group(1), "mac": m.group(2)})
+    return devices
+
+
+def get_connection_counts():
+    """Active connection count per source IP, via conntrack. Requires the
+    `conntrack` package — returns {} silently if it isn't installed."""
+    out = run_cmd("conntrack -L -n 2>/dev/null")
+    counts = {}
+    for line in out.splitlines():
+        m = re.search(r"\bsrc=(\d+\.\d+\.\d+\.\d+)", line)
+        if m:
+            ip = m.group(1)
+            counts[ip] = counts.get(ip, 0) + 1
+    return counts
+
+
+def get_connected_devices():
+    """Merge ARP-known LAN devices with their live conntrack connection
+    counts, sorted busiest-first."""
+    devices = get_lan_clients()
+    counts = get_connection_counts()
+    for d in devices:
+        d["connections"] = counts.get(d["ip"], 0)
+    devices.sort(key=lambda d: d["connections"], reverse=True)
+    return devices
 
 
 # ---------------------------------------------------------------------------
@@ -411,8 +477,8 @@ BASE = """
           <div class="page-sub">{{ subtitle }}</div>
         </div>
         <div class="status-pill">
-          <div class="dot {{ 'on' if warp_connected else 'off' }}"></div>
-          {{ 'WARP CONNECTED' if warp_connected else 'WARP DISCONNECTED' }}
+          <div class="dot {{ 'on' if warp_connected else 'off' }}" id="warp-status-dot"></div>
+          <span id="warp-status-label">{{ 'WARP CONNECTED' if warp_connected else 'WARP DISCONNECTED' }}</span>
         </div>
       </div>
 
@@ -478,6 +544,63 @@ def logout():
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
+def render_device_rows(devices):
+    """Build the <tr> rows for the Connected Devices table. Shared by the
+    initial server-rendered page and the JSON API (so both use identical
+    formatting logic — the JS just calls this row shape too)."""
+    if not devices:
+        return '<tr><td colspan="3" style="padding:10px 0;color:var(--muted);">No devices found in the ARP table yet.</td></tr>'
+    rows = []
+    for d in devices:
+        rows.append(
+            f'<tr><td style="padding:8px 0;border-bottom:1px solid var(--border);">{d["ip"]}</td>'
+            f'<td style="padding:8px 0;border-bottom:1px solid var(--border);color:var(--muted);font-size:12px;">{d["mac"]}</td>'
+            f'<td style="padding:8px 0;border-bottom:1px solid var(--border);text-align:right;font-weight:600;">{d["connections"]}</td></tr>'
+        )
+    return "".join(rows)
+
+
+# JS lives in a PLAIN string (not an f-string) so its { } braces never clash
+# with Python's f-string parsing. __API_URL__ is swapped in at request time.
+DASHBOARD_POLL_SCRIPT = """
+<script>
+(function() {
+  const API_URL = "__API_URL__";
+  async function refreshDashboard() {
+    try {
+      const res = await fetch(API_URL, { cache: "no-store" });
+      if (!res.ok) return;
+      const d = await res.json();
+
+      document.getElementById('rx-rate').textContent = d.rx_rate_human;
+      document.getElementById('tx-rate').textContent = d.tx_rate_human;
+      document.getElementById('data-total').textContent =
+        'Total since boot — RX ' + d.rx_total_human + ', TX ' + d.tx_total_human;
+
+      const dot = document.getElementById('warp-status-dot');
+      const label = document.getElementById('warp-status-label');
+      if (dot) dot.className = 'dot ' + (d.connected ? 'on' : 'off');
+      if (label) label.textContent = d.connected ? 'WARP CONNECTED' : 'WARP DISCONNECTED';
+
+      const modeBadge = document.getElementById('mode-badge');
+      if (modeBadge) modeBadge.textContent = d.mode.toUpperCase();
+
+      const countBadge = document.getElementById('device-count-badge');
+      if (countBadge) countBadge.textContent = d.device_count + (d.device_count === 1 ? ' device' : ' devices');
+
+      const tbody = document.getElementById('device-table-body');
+      if (tbody) tbody.innerHTML = d.device_rows_html;
+    } catch (e) {
+      // Silent — a single missed poll shouldn't spam the console.
+    }
+  }
+  refreshDashboard();
+  setInterval(refreshDashboard, 2000);
+})();
+</script>
+"""
+
+
 @app.route("/dashboard")
 @login_required
 def dashboard():
@@ -488,8 +611,8 @@ def dashboard():
     mode = get_warp_mode()
 
     iface = get_default_iface()
-    rx_rate, tx_rate = get_throughput(iface, sample_seconds=1.0)
-    rx_total, tx_total = get_iface_bytes(iface)
+    rx_rate, tx_rate, rx_total, tx_total = get_throughput_nonblocking(iface)
+    devices = get_connected_devices()
 
     st = speedtest_state
     if st["running"]:
@@ -512,7 +635,7 @@ def dashboard():
       <div class="card">
         <h3>{icon('power')} WARP Connection</h3>
         <div class="info-row"><span class="label">Status</span><span class="badge {'on' if connected else 'off'}">{'CONNECTED' if connected else 'DISCONNECTED'}</span></div>
-        <div class="info-row"><span class="label">Mode</span><span class="badge mode">{mode.upper()}</span></div>
+        <div class="info-row"><span class="label">Mode</span><span class="badge mode" id="mode-badge">{mode.upper()}</span></div>
         <div class="info-row"><span class="label">Public WAN IP</span><span class="value">{pub_ip}</span></div>
         <div class="info-row"><span class="label">Gateway LAN IP</span><span class="value">{gw_ip}</span></div>
         <div style="margin-top:16px;" class="btn-row">
@@ -523,18 +646,18 @@ def dashboard():
       </div>
 
       <div class="card">
-        <h3>{icon('activity')} Live Throughput ({iface or 'no default route'})</h3>
+        <h3>{icon('activity')} Live Throughput ({iface or 'no default route'}) <span style="font-weight:400;color:var(--muted);font-size:11px;">auto-refreshes every 2s</span></h3>
         <div class="speed-row">
           <div class="speed-col">
             <div class="dirlabel">↓ Download</div>
-            <div class="stat-big">{humanize_bytes(rx_rate)}/s</div>
+            <div class="stat-big" id="rx-rate">{humanize_bytes(rx_rate)}/s</div>
           </div>
           <div class="speed-col">
             <div class="dirlabel">↑ Upload</div>
-            <div class="stat-big">{humanize_bytes(tx_rate)}/s</div>
+            <div class="stat-big" id="tx-rate">{humanize_bytes(tx_rate)}/s</div>
           </div>
         </div>
-        <div class="stat-sub" style="margin-top:12px;">Total since boot — RX {humanize_bytes(rx_total)}, TX {humanize_bytes(tx_total)}</div>
+        <div class="stat-sub" style="margin-top:12px;" id="data-total">Total since boot — RX {humanize_bytes(rx_total)}, TX {humanize_bytes(tx_total)}</div>
       </div>
     </div>
 
@@ -552,8 +675,48 @@ def dashboard():
         <pre class="log-box" style="max-height:160px;">{status_out}</pre>
       </div>
     </div>
+
+    <div class="card">
+      <h3>{icon('server')} Connected Devices <span class="badge mode" id="device-count-badge" style="margin-left:6px;">{len(devices)} devices</span></h3>
+      <p style="color:var(--muted);font-size:12px;margin-bottom:10px;">IP and MAC from the ARP table; active connection count per IP from conntrack (requires the <code style="background:var(--panel-2);padding:1px 6px;border-radius:5px;">conntrack</code> package).</p>
+      <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <thead>
+          <tr style="text-align:left;color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;">
+            <th style="padding-bottom:8px;">IP Address</th>
+            <th style="padding-bottom:8px;">MAC Address</th>
+            <th style="padding-bottom:8px;text-align:right;">Active Connections</th>
+          </tr>
+        </thead>
+        <tbody id="device-table-body">{render_device_rows(devices)}</tbody>
+      </table>
+    </div>
     """
+    content += DASHBOARD_POLL_SCRIPT.replace("__API_URL__", url_for("api_dashboard_stats"))
     return render_page("dashboard", "Dashboard", "Live gateway status and quick controls", content)
+
+
+@app.route("/api/dashboard-stats")
+@login_required
+def api_dashboard_stats():
+    """JSON snapshot polled by the dashboard's JS every 2s so the page never
+    needs a manual refresh."""
+    connected = is_warp_connected()
+    mode = get_warp_mode()
+    iface = get_default_iface()
+    rx_rate, tx_rate, rx_total, tx_total = get_throughput_nonblocking(iface)
+    devices = get_connected_devices()
+    return jsonify({
+        "connected": connected,
+        "mode": mode,
+        "iface": iface,
+        "rx_rate_human": humanize_bytes(rx_rate) + "/s",
+        "tx_rate_human": humanize_bytes(tx_rate) + "/s",
+        "rx_total_human": humanize_bytes(rx_total),
+        "tx_total_human": humanize_bytes(tx_total),
+        "device_count": len(devices),
+        "devices": devices,
+        "device_rows_html": render_device_rows(devices),
+    })
 
 
 @app.route("/warp/toggle/<action>", methods=["POST"])
