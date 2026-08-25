@@ -25,6 +25,20 @@ CDN_SETTINGS_FILE    = "/opt/warpgateway/cdn_settings.json"
 COUNTRY_SETTINGS_FILE = "/opt/warpgateway/country_settings.json"
 SERVICE_NAME         = "warpgateway"
 
+# Current running versions — must match the 'ver' file in the GitHub repo.
+APP_VERSION       = "1.0.1"
+INSTALLER_VERSION = "1.0.1"
+
+# GitHub raw URLs used by the auto-updater
+GH_VER_URL     = "https://raw.githubusercontent.com/R47DEV/warp-gateway/refs/heads/main/ver"
+GH_APP_URL     = "https://raw.githubusercontent.com/R47DEV/warp-gateway/main/app.py"
+GH_INSTALL_URL = "https://raw.githubusercontent.com/R47DEV/warp-gateway/main/install.sh"
+
+# Local script paths (used by the auto-updater)
+APP_SCRIPT_PATH     = "/opt/warpgateway/app.py"
+INSTALL_SCRIPT_PATH = "/opt/warpgateway/install.sh"
+
+
 
 # ---------------------------------------------------------------------------
 # Credential storage helpers (hashed, persisted to disk, hot-reloaded)
@@ -970,11 +984,92 @@ def get_connected_devices():
 
 
 
+# ---------------------------------------------------------------------------
+# Traffic routing analysis: bypass vs WARP-encrypted connections
+# ---------------------------------------------------------------------------
+def get_traffic_routing_stats():
+    """Analyse the conntrack table to count active connections split by routing
+    path: WARP-encrypted tunnel vs direct ISP bypass.
+
+    Heuristic: a connection is 'bypassed' if its destination IP falls within
+    any ip route that exits via the physical ISP uplink interface (not
+    CloudflareWARP). All other connections are assumed to traverse the WARP
+    encrypted tunnel.
+
+    Returns a dict with keys:
+        warp_connections    - int, connections going through WARP tunnel
+        bypass_connections  - int, connections going via direct ISP route
+        total_connections   - int, sum of all active conntrack entries
+        active_bypass_routes - int, distinct CIDR blocks currently bypassed
+        bypass_bytes_total  - int, raw bytes tracked for bypassed flows
+        warp_bytes_total    - int, raw bytes tracked for WARP-tunnelled flows
+    """
+    try:
+        iface, _gw = detect_uplink()
+        bypass_nets = set()
+
+        if iface:
+            route_out = run_cmd(f"ip route show dev {iface}")
+            for line in route_out.splitlines():
+                parts = line.strip().split()
+                if parts:
+                    try:
+                        bypass_nets.add(ipaddress.ip_network(parts[0], strict=False))
+                    except ValueError:
+                        pass
+
+        active_bypass_routes = len(bypass_nets)
+
+        # Also include IPs resolved for domain-based custom rules.
+        for rule in load_bypass_rules():
+            for ip_str in rule.get("resolved_ips", []):
+                try:
+                    bypass_nets.add(ipaddress.ip_network(ip_str, strict=False))
+                except ValueError:
+                    pass
+
+        out = run_cmd("conntrack -L -n 2>/dev/null")
+        warp_connections = bypass_connections = warp_bytes = bypass_bytes = 0
+
+        for line in out.splitlines():
+            dst_matches = re.findall(r"\bdst=(\d+\.\d+\.\d+\.\d+)", line)
+            byte_counts  = re.findall(r"\bbytes=(\d+)", line)
+            if not dst_matches:
+                continue
+            total_line_bytes = sum(int(b) for b in byte_counts)
+            try:
+                addr = ipaddress.ip_address(dst_matches[0])
+                is_bypass = any(addr in net for net in bypass_nets)
+            except ValueError:
+                is_bypass = False
+
+            if is_bypass:
+                bypass_connections += 1
+                bypass_bytes += total_line_bytes
+            else:
+                warp_connections += 1
+                warp_bytes += total_line_bytes
+
+        return {
+            "warp_connections":     warp_connections,
+            "bypass_connections":   bypass_connections,
+            "total_connections":    warp_connections + bypass_connections,
+            "active_bypass_routes": active_bypass_routes,
+            "bypass_bytes_total":   bypass_bytes,
+            "warp_bytes_total":     warp_bytes,
+        }
+    except Exception:
+        return {
+            "warp_connections": 0, "bypass_connections": 0, "total_connections": 0,
+            "active_bypass_routes": 0, "bypass_bytes_total": 0, "warp_bytes_total": 0,
+        }
+
 
 # ---------------------------------------------------------------------------
 # On-demand speed test (runs in a background thread; result cached)
 # ---------------------------------------------------------------------------
 speedtest_state = {"running": False, "result": None, "error": None, "ran_at": None}
+
 
 
 def run_speedtest_bg():
@@ -1021,6 +1116,11 @@ ICONS = {
     "github": '<path d="M9 19c-4.3 1.4-4.3-2.5-6-3m12 5v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1.1-.3-3.5 1.3a12.3 12.3 0 0 0-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/>',
     "activity": '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
     "gauge": '<path d="M12 14 15 9"/><circle cx="12" cy="12" r="10"/><path d="M8 12a4 4 0 0 1 8 0"/>',
+    "download": '<polyline points="8 17 12 21 16 17"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.88 18.09A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.29"/>',
+    "update": '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
+    "lock": '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+    "info": '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>',
+    "zap": '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
 }
 
 
@@ -1080,7 +1180,64 @@ BASE = """
   .footer-credit a{display:inline-flex;align-items:center;gap:6px;color:var(--muted);}
   .footer-credit a:hover{color:var(--accent1);}
 
+  /* ---- Version badge + update button in sidebar ---- */
+  .ver-badge{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;
+    background:var(--panel-2);border:1px solid var(--border);border-radius:10px;margin-top:4px;font-size:12px;}
+  .ver-badge .ver-label{color:var(--muted);font-size:10.5px;margin-bottom:1px;}
+  .ver-badge .ver-num{font-weight:700;color:#a5c8ff;font-size:12px;}
+  .ver-check-btn{display:inline-flex;align-items:center;gap:4px;background:transparent;
+    border:1px solid rgba(79,142,247,.4);color:var(--accent1);border-radius:7px;
+    padding:4px 9px;font-size:11px;font-weight:600;cursor:pointer;transition:.15s;white-space:nowrap;}
+  .ver-check-btn:hover{background:rgba(79,142,247,.15);}
+  .ver-update-btn{display:inline-flex;align-items:center;gap:4px;
+    background:linear-gradient(135deg,var(--accent1),var(--accent2));border:none;color:#fff;border-radius:7px;
+    padding:4px 9px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;
+    animation:pulse-ver 2s infinite;}
+  @keyframes pulse-ver{0%,100%{box-shadow:0 0 0 0 rgba(79,142,247,.5);}50%{box-shadow:0 0 0 5px rgba(79,142,247,0);}}
+  .update-notif{padding:9px 12px;border-radius:9px;font-size:11.5px;margin-top:6px;
+    background:rgba(79,142,247,.1);border:1px solid rgba(79,142,247,.25);color:#a5c8ff;line-height:1.5;}
+
+  /* ---- Traffic routing stats card ---- */
+  .traffic-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:16px 0 14px 0;}
+  .tstat{background:var(--panel-2);border:1px solid var(--border);border-radius:12px;padding:14px 16px;position:relative;overflow:hidden;}
+  .tstat::before{content:'';position:absolute;top:0;left:0;width:3px;height:100%;border-radius:3px 0 0 3px;}
+  .tstat.tw::before{background:linear-gradient(180deg,var(--accent1),var(--accent2));}
+  .tstat.tb::before{background:linear-gradient(180deg,var(--green),#16a34a);}
+  .tstat.tn::before{background:linear-gradient(180deg,var(--amber),#d97706);}
+  .tstat .ts-lbl{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:600;margin-bottom:6px;}
+  .tstat .ts-val{font-size:24px;font-weight:800;line-height:1;letter-spacing:-.5px;}
+  .tstat .ts-sub{font-size:10.5px;color:var(--muted);margin-top:5px;}
+  .tstat.tw .ts-val{background:linear-gradient(135deg,var(--accent1),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+  .tstat.tb .ts-val{background:linear-gradient(135deg,var(--green),#16a34a);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+  .tstat.tn .ts-val{color:var(--amber);}
+  .traffic-bars{margin-top:14px;display:flex;flex-direction:column;gap:10px;}
+  .tbar-row{display:flex;flex-direction:column;gap:4px;}
+  .tbar-labels{display:flex;justify-content:space-between;font-size:11.5px;}
+  .tbar-labels .tbl{color:var(--muted);}
+  .tbar-track{height:8px;background:rgba(255,255,255,.06);border-radius:999px;overflow:hidden;border:1px solid var(--border);}
+  .tbar-fill{height:100%;border-radius:999px;transition:width .7s cubic-bezier(.4,0,.2,1);}
+  .tbar-fill.tw{background:linear-gradient(90deg,var(--accent1),var(--accent2));}
+  .tbar-fill.tb{background:linear-gradient(90deg,var(--green),#16a34a);}
+
+  /* ---- Instruction card on bypass page ---- */
+  .instr-card{background:linear-gradient(135deg,rgba(79,142,247,.06),rgba(124,92,252,.06));
+    border:1px solid rgba(124,92,252,.22);border-radius:16px;padding:20px 22px;margin-bottom:16px;}
+  .instr-card > .instr-title{font-size:13.5px;font-weight:700;color:#dbe4f3;margin-bottom:14px;display:flex;align-items:center;gap:8px;}
+  .instr-cols{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  @media(max-width:640px){.instr-cols{grid-template-columns:1fr;}}
+  .instr-col{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:12px;padding:14px 16px;}
+  .instr-col .ic-head{font-size:12px;font-weight:700;color:var(--accent1);margin-bottom:10px;display:flex;align-items:center;gap:6px;}
+  .instr-col ul{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:6px;}
+  .instr-col ul li{font-size:12.5px;color:var(--muted);padding-left:14px;position:relative;line-height:1.6;}
+  .instr-col ul li::before{content:'→';position:absolute;left:0;color:rgba(79,142,247,.6);font-size:11px;top:1px;}
+  .instr-col ul li strong{color:#c7d8f5;font-weight:600;}
+  .instr-col ul li .tag{display:inline-block;padding:1px 7px;border-radius:5px;font-size:10.5px;font-weight:600;
+    background:rgba(79,142,247,.15);color:#a5c8ff;margin-left:3px;border:1px solid rgba(79,142,247,.25);}
+  .instr-col ul li .tag.green{background:rgba(34,197,94,.12);color:#86efac;border-color:rgba(34,197,94,.25);}
+  .instr-col ul li .tag.amber{background:rgba(245,158,11,.12);color:#fcd34d;border-color:rgba(245,158,11,.25);}
+
   .main{flex:1;padding:28px 36px;}
+
   .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;flex-wrap:wrap;gap:12px;}
   .page-title{font-size:22px;font-weight:700;}
   .page-sub{color:var(--muted);font-size:13px;margin-top:2px;}
@@ -1199,7 +1356,17 @@ BASE = """
       <a class="nav-item {{ 'active' if page=='settings' else '' }}" href="{{ url_for('settings') }}">{{ icon('settings') }} Admin Settings</a>
       <a class="nav-item {{ 'active' if page=='guide' else '' }}" href="{{ url_for('guide') }}">{{ icon('guide') }} Setup Guide</a>
       <div class="nav-spacer"></div>
-      <a class="nav-item" href="{{ url_for('logout') }}">{{ icon('logout') }} Logout</a>
+      <!-- Version badge & update action -->
+      <div class="ver-badge">
+        <div>
+          <div class="ver-label">App Version</div>
+          <div class="ver-num" id="sidebar-ver">v{{ app_version }}</div>
+        </div>
+        <button class="ver-check-btn" id="ver-check-btn" onclick="checkForUpdate()">{{ icon('update',12) }} Check</button>
+      </div>
+      <div id="update-notif" class="update-notif" style="display:none;"></div>
+
+      <a class="nav-item" href="{{ url_for('logout') }}" style="margin-top:4px;">{{ icon('logout') }} Logout</a>
 
       <div class="dev-credit">
         <a href="https://github.com/R47DEV/warp-gateway" target="_blank" rel="noopener noreferrer">
@@ -1231,12 +1398,88 @@ BASE = """
       {{ content|safe }}
 
       <div class="footer-credit">
-        <span>WARP Gateway Enterprise Console</span>
+        <span>WARP Gateway Enterprise Console &nbsp;·&nbsp; v{{ app_version }}</span>
         <a href="https://github.com/R47DEV/warp-gateway" target="_blank" rel="noopener noreferrer">{{ icon('github',14) }} Developed by R47DEV — github.com/R47DEV/warp-gateway</a>
       </div>
     </div>
   </div>
 {% endif %}
+
+<script>
+function checkForUpdate() {
+  const btn = document.getElementById('ver-check-btn');
+  const notif = document.getElementById('update-notif');
+  if (!btn) return;
+  btn.textContent = '…';
+  btn.disabled = true;
+  fetch('/api/check_update')
+    .then(r => r.json())
+    .then(d => {
+      btn.disabled = false;
+      if (d.has_update) {
+        btn.className = 'ver-update-btn';
+        btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Update!';
+        btn.onclick = function() { triggerUpdate(d); };
+        notif.style.display = 'block';
+        notif.innerHTML = '🚀 v' + d.remote_app_ver + ' available! Click <b>Update!</b> to install.';
+      } else {
+        notif.style.display = 'block';
+        notif.innerHTML = '✅ You are running the latest version.';
+        notif.style.color = '#86efac';
+        notif.style.background = 'rgba(34,197,94,.1)';
+        notif.style.borderColor = 'rgba(34,197,94,.3)';
+        btn.textContent = '✓ Latest';
+        setTimeout(() => {
+          notif.style.display = 'none';
+          btn.className = 'ver-check-btn';
+          btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Check';
+          btn.onclick = checkForUpdate;
+        }, 4000);
+      }
+      if (d.error) {
+        notif.style.display = 'block';
+        notif.style.color = '#fca5a5';
+        notif.innerHTML = '⚠ ' + d.error;
+        btn.textContent = 'Retry';
+      }
+    })
+    .catch(() => {
+      btn.disabled = false;
+      btn.textContent = 'Error';
+    });
+}
+
+function triggerUpdate(d) {
+  if (!confirm('This will download and install the latest version, then restart the service.\n\nProceed?')) return;
+  const notif = document.getElementById('update-notif');
+  notif.style.display = 'block';
+  notif.style.color = '#a5c8ff';
+  notif.style.background = 'rgba(79,142,247,.12)';
+  notif.style.borderColor = 'rgba(79,142,247,.3)';
+  notif.innerHTML = '⏳ Downloading update… please wait.';
+  fetch('/api/trigger_update', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({update_type: d.update_type})
+  })
+    .then(r => r.json())
+    .then(r => {
+      if (r.success) {
+        notif.style.color = '#86efac';
+        notif.style.background = 'rgba(34,197,94,.1)';
+        notif.innerHTML = '✅ Update applied! Service is restarting… please refresh in 10 seconds.';
+      } else {
+        notif.style.color = '#fca5a5';
+        notif.innerHTML = '❌ Update failed: ' + r.error;
+      }
+    })
+    .catch(() => {
+      notif.style.color = '#86efac';
+      notif.style.background = 'rgba(34,197,94,.1)';
+      notif.innerHTML = '✅ Update signal sent! Service is restarting… please refresh in 10 seconds.';
+    });
+}
+</script>
 </body>
 </html>
 """
@@ -1250,6 +1493,7 @@ def render_page(page, title, subtitle, content):
         subtitle=subtitle,
         content=content,
         warp_connected=is_warp_connected() if session.get("logged_in") else False,
+        app_version=APP_VERSION,
     )
 
 
@@ -1334,6 +1578,27 @@ DASHBOARD_POLL_SCRIPT = """
 
       const tbody = document.getElementById('device-table-body');
       if (tbody) tbody.innerHTML = d.device_rows_html;
+
+      /* Traffic Routing Analysis elements */
+      const tw = document.getElementById('tstat-warp');
+      const tb = document.getElementById('tstat-bypass');
+      const tr = document.getElementById('tstat-routes');
+      const twFill = document.getElementById('tbar-warp-fill');
+      const tbFill = document.getElementById('tbar-bypass-fill');
+      const twLbl = document.getElementById('tbar-warp-lbl');
+      const tbLbl = document.getElementById('tbar-bypass-lbl');
+      const twBytes = document.getElementById('tbar-warp-bytes');
+      const tbBytes = document.getElementById('tbar-bypass-bytes');
+
+      if (tw) tw.textContent = d.tstats.warp_connections;
+      if (tb) tb.textContent = d.tstats.bypass_connections;
+      if (tr) tr.textContent = d.tstats.active_bypass_routes;
+      if (twFill) twFill.style.width = d.tstats.warp_pct + '%';
+      if (tbFill) tbFill.style.width = d.tstats.bypass_pct + '%';
+      if (twLbl) twLbl.textContent = 'WARP Encrypted Tunnel (' + d.tstats.warp_pct + '%)';
+      if (tbLbl) tbLbl.textContent = 'Direct ISP Bypassed (' + d.tstats.bypass_pct + '%)';
+      if (twBytes) twBytes.textContent = d.tstats.warp_bytes_human;
+      if (tbBytes) tbBytes.textContent = d.tstats.bypass_bytes_human;
     } catch (e) {
       // Silent — a single missed poll shouldn't spam the console.
     }
@@ -1357,6 +1622,11 @@ def dashboard():
     iface = get_default_iface()
     rx_rate, tx_rate, rx_total, tx_total = get_throughput_nonblocking(iface)
     devices = get_connected_devices()
+    tstats = get_traffic_routing_stats()
+
+    tot_conns = tstats["total_connections"] or 1
+    warp_pct = round((tstats["warp_connections"] / tot_conns) * 100, 1) if tstats["total_connections"] > 0 else 0
+    bypass_pct = round((tstats["bypass_connections"] / tot_conns) * 100, 1) if tstats["total_connections"] > 0 else 0
 
     st = speedtest_state
     if st["running"]:
@@ -1402,6 +1672,48 @@ def dashboard():
           </div>
         </div>
         <div class="stat-sub" style="margin-top:12px;" id="data-total">Total since boot — RX {humanize_bytes(rx_total)}, TX {humanize_bytes(tx_total)}</div>
+      </div>
+    </div>
+
+    <!-- Real-time Traffic Routing Analysis Card -->
+    <div class="card" style="margin-bottom:20px;">
+      <h3>{icon('zap')} Traffic Routing Analysis <span style="font-weight:400;color:var(--muted);font-size:11.5px;margin-left:8px;">Live conntrack inspection &amp; active route state</span></h3>
+      <div class="traffic-grid">
+        <div class="tstat tw">
+          <div class="ts-lbl">WARP Encrypted</div>
+          <div class="ts-val" id="tstat-warp">{tstats['warp_connections']}</div>
+          <div class="ts-sub">Active connections</div>
+        </div>
+        <div class="tstat tb">
+          <div class="ts-lbl">Direct ISP Bypassed</div>
+          <div class="ts-val" id="tstat-bypass">{tstats['bypass_connections']}</div>
+          <div class="ts-sub">Active connections</div>
+        </div>
+        <div class="tstat tn">
+          <div class="ts-lbl">Active Bypass CIDRs</div>
+          <div class="ts-val" id="tstat-routes">{tstats['active_bypass_routes']}</div>
+          <div class="ts-sub">Exempted IP blocks</div>
+        </div>
+      </div>
+      <div class="traffic-bars">
+        <div class="tbar-row">
+          <div class="tbar-labels">
+            <span class="tbl" id="tbar-warp-lbl">WARP Encrypted Tunnel ({warp_pct}%)</span>
+            <span class="tbl" id="tbar-warp-bytes">{humanize_bytes(tstats['warp_bytes_total'])}</span>
+          </div>
+          <div class="tbar-track">
+            <div class="tbar-fill tw" id="tbar-warp-fill" style="width:{warp_pct}%;"></div>
+          </div>
+        </div>
+        <div class="tbar-row">
+          <div class="tbar-labels">
+            <span class="tbl" id="tbar-bypass-lbl">Direct ISP Bypassed ({bypass_pct}%)</span>
+            <span class="tbl" id="tbar-bypass-bytes">{humanize_bytes(tstats['bypass_bytes_total'])}</span>
+          </div>
+          <div class="tbar-track">
+            <div class="tbar-fill tb" id="tbar-bypass-fill" style="width:{bypass_pct}%;"></div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1451,6 +1763,14 @@ def api_dashboard_stats():
     iface = get_default_iface()
     rx_rate, tx_rate, rx_total, tx_total = get_throughput_nonblocking(iface)
     devices = get_connected_devices()
+    tstats = get_traffic_routing_stats()
+
+    tot_conns = tstats["total_connections"] or 1
+    tstats["warp_pct"] = round((tstats["warp_connections"] / tot_conns) * 100, 1) if tstats["total_connections"] > 0 else 0
+    tstats["bypass_pct"] = round((tstats["bypass_connections"] / tot_conns) * 100, 1) if tstats["total_connections"] > 0 else 0
+    tstats["warp_bytes_human"] = humanize_bytes(tstats["warp_bytes_total"])
+    tstats["bypass_bytes_human"] = humanize_bytes(tstats["bypass_bytes_total"])
+
     return jsonify({
         "connected": connected,
         "mode": mode,
@@ -1462,6 +1782,7 @@ def api_dashboard_stats():
         "device_count": len(devices),
         "devices": devices,
         "device_rows_html": render_device_rows(devices),
+        "tstats": tstats,
     })
 
 
@@ -1706,6 +2027,27 @@ def bypass():
     )
 
     content = f"""
+    <!-- Global Configuration & Bypass Guide Card -->
+    <div class="instr-card">
+      <div class="instr-title">{icon('info', 18)} Split-Tunnel &amp; Auto-Bypass Configuration Guide</div>
+      <div class="instr-cols">
+        <div class="instr-col">
+          <div class="ic-head">{icon('shield', 14)} Domestic &amp; Regional Banking Services</div>
+          <ul>
+            <li><strong>National IP Auto-Bypass:</strong> Select your home country or ISO code (e.g. <span class="tag green">BD</span> <span class="tag green">IN</span> <span class="tag green">AE</span> <span class="tag green">US</span>) to route all authoritative ISP blocks directly through local uplink.</li>
+            <li><strong>Global CDN Edge Sync:</strong> Enable <span class="tag green">Cloudflare CDN</span>, <span class="tag green">AWS CloudFront</span>, and <span class="tag green">AWS Asia-Pacific</span> to ensure mobile banking APIs connect without location error messages.</li>
+          </ul>
+        </div>
+        <div class="instr-col">
+          <div class="ic-head">{icon('network', 14)} Custom Domain &amp; Subdomain Rules</div>
+          <ul>
+            <li><strong>Wildcard Domains:</strong> Add <code>*.example.com</code> to automatically probe common payment, login, and static asset subdomains.</li>
+            <li><strong>One-Click Backup &amp; Import:</strong> Click <strong>Export Rules</strong> to download a backup file of all active custom rules. The downloaded file can be pasted directly into the input box below.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
     <!-- Country IP Range Auto-Bypass Card -->
     <div class="card" style="margin-bottom:16px;">
       <h3>{icon('network')} National IP Auto-Bypass (By Country / Region)
@@ -1797,6 +2139,7 @@ def bypass():
         <form method="POST" action="{url_for('bypass_refresh_all')}">
           <button class="btn btn-outline btn-sm">{icon('activity',14)} Re-apply / Re-resolve All</button>
         </form>
+        <a href="{url_for('bypass_export')}" class="btn btn-outline btn-sm" style="text-decoration:none;">{icon('download',14)} Export Rules</a>
       </div>
       <table style="width:100%;border-collapse:collapse;font-size:13px;">
         <thead>
@@ -1906,6 +2249,28 @@ def bypass_refresh_all():
     apply_all_bypass_rules()
     flash("All bypass rules re-applied.", "success")
     return redirect(url_for("bypass"))
+
+
+@app.route("/bypass/export")
+@login_required
+def bypass_export():
+    """Export all custom bypass rules as a clean plain-text file (one entry per line)
+    so they can be easily backed up or re-imported into the gateway."""
+    rules = load_bypass_rules()
+    lines = []
+    for r in rules:
+        if r.get("type") == "wildcard":
+            lines.append(f"*.{r['value']}")
+        else:
+            lines.append(r.get("value", ""))
+    export_text = "\n".join(filter(None, lines)) + "\n"
+    from flask import Response
+    return Response(
+        export_text,
+        mimetype="text/plain",
+        headers={"Content-Disposition": "attachment; filename=warp_gateway_bypass_rules.txt"}
+    )
+
 
 
 @app.route("/bypass/delete/<rule_id>", methods=["POST"])
@@ -2268,6 +2633,119 @@ def guide():
     </div>
     """
     return render_page("guide", "Setup Guide", "Router configuration reference for this gateway", content)
+
+
+# ---------------------------------------------------------------------------
+# Auto-Update API Routes
+# ---------------------------------------------------------------------------
+@app.route("/api/check_update")
+@login_required
+def api_check_update():
+    """Fetch version metadata from GitHub's raw 'ver' file and compare against
+    the current local APP_VERSION and INSTALLER_VERSION constants."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            GH_VER_URL,
+            headers={"User-Agent": "WARP-Gateway-Updater/1.0", "Cache-Control": "no-cache"}
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            raw = resp.read().decode("utf-8")
+
+        remote_app_ver = APP_VERSION
+        remote_installer_ver = INSTALLER_VERSION
+
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("app_ver:"):
+                remote_app_ver = line.split(":", 1)[1].strip()
+            elif line.startswith("installer_ver:"):
+                remote_installer_ver = line.split(":", 1)[1].strip()
+
+        def _ver_tuple(v):
+            return tuple(int(x) for x in v.split(".") if x.isdigit())
+
+        app_newer = _ver_tuple(remote_app_ver) > _ver_tuple(APP_VERSION)
+        installer_newer = _ver_tuple(remote_installer_ver) > _ver_tuple(INSTALLER_VERSION)
+        has_update = app_newer or installer_newer
+
+        update_type = "none"
+        if app_newer and installer_newer:
+            update_type = "both"
+        elif app_newer:
+            update_type = "app"
+        elif installer_newer:
+            update_type = "installer"
+
+        return jsonify({
+            "local_app_ver": APP_VERSION,
+            "remote_app_ver": remote_app_ver,
+            "local_installer_ver": INSTALLER_VERSION,
+            "remote_installer_ver": remote_installer_ver,
+            "has_update": has_update,
+            "update_type": update_type,
+            "error": None,
+        })
+    except Exception as exc:
+        return jsonify({
+            "local_app_ver": APP_VERSION,
+            "remote_app_ver": APP_VERSION,
+            "has_update": False,
+            "update_type": "none",
+            "error": f"Could not check update server: {str(exc)}",
+        })
+
+
+@app.route("/api/trigger_update", methods=["POST"])
+@login_required
+def api_trigger_update():
+    """Download the latest app.py (and install.sh if installer_ver updated)
+    from GitHub, validate non-empty content and valid syntax, replace local
+    files, and trigger a background systemctl restart."""
+    try:
+        import urllib.request
+
+        # 1. Download latest app.py from GitHub
+        req_app = urllib.request.Request(
+            GH_APP_URL,
+            headers={"User-Agent": "WARP-Gateway-Updater/1.0", "Cache-Control": "no-cache"}
+        )
+        with urllib.request.urlopen(req_app, timeout=15) as resp:
+            new_app_code = resp.read().decode("utf-8")
+
+        # Basic integrity check: must contain Flask app definition
+        if "app = Flask(__name__)" not in new_app_code or len(new_app_code) < 1000:
+            return jsonify({"success": False, "error": "Downloaded file failed integrity check."})
+
+        # Save downloaded app.py to actual script location
+        target_path = APP_SCRIPT_PATH if os.path.exists(APP_SCRIPT_PATH) else os.path.abspath(__file__)
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(new_app_code)
+
+        # 2. Check if installer script update is requested/needed
+        req_type = (request.json or {}).get("update_type", "app")
+        if req_type in ("installer", "both"):
+            try:
+                req_inst = urllib.request.Request(
+                    GH_INSTALL_URL,
+                    headers={"User-Agent": "WARP-Gateway-Updater/1.0", "Cache-Control": "no-cache"}
+                )
+                with urllib.request.urlopen(req_inst, timeout=15) as resp:
+                    new_inst_code = resp.read().decode("utf-8")
+
+                if len(new_inst_code) > 500:
+                    inst_target = INSTALL_SCRIPT_PATH if os.path.exists(INSTALL_SCRIPT_PATH) else "install.sh"
+                    with open(inst_target, "w", encoding="utf-8") as f:
+                        f.write(new_inst_code)
+                    os.chmod(inst_target, 0o755)
+            except Exception:
+                pass
+
+        # 3. Schedule background restart
+        threading.Thread(target=delayed_restart, daemon=True).start()
+        return jsonify({"success": True, "message": "Update successfully applied! Service is restarting..."})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)})
 
 
 if __name__ == "__main__":
