@@ -36,12 +36,12 @@ It comes with a built-in modern, Glassmorphism-styled Web Dashboard secured with
 
 ## 🖥️ System Requirements
 
-* **Operating System:** Ubuntu 22.04 LTS (Recommended) / Debian 11+
-* **Supported Environments:** Proxmox LXC Container (Privileged with TUN/TAP enabled), KVM VM, Dedicated Server, or Raspberry Pi.
+* **Operating System:** Ubuntu 22.04 LTS (Recommended) 
+* **Supported Environments:** Proxmox LXC Container (Privileged with TUN/TAP enabled > [Unprivieged contaner Uncheck]), KVM VM, Dedicated Server, or Raspberry Pi.
 * **Resource Footprint:** 
   * CPU: 1 Core
   * RAM: 256 MB (512 MB recommended)
-  * Disk: 4 GB
+  * Disk: 6 GB
 
 ---
 
@@ -97,7 +97,7 @@ To route a specific device's internet traffic (e.g., Smart TV, PC, Mobile) throu
 
 1. Open your device's **Network Settings**.
 2. Change IP Configuration from **DHCP** to **Static**.
-3. Set the **Default Gateway / Router IP** to your **WARP Gateway IP** (e.g., `192.168.0.222`).
+3. Set the **Default Gateway / Router IP** to your **WARP Gateway IP** (e.g., your WARP Gateway web ui ip `192.168.0.222`).
 4. Set DNS to your preferred server (e.g., `1.1.1.1` or AdGuard Home IP).
 
 ---
