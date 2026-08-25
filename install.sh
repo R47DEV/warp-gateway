@@ -100,38 +100,42 @@ pip3 install flask werkzeug >/dev/null 2>&1 || apt install -y python3-flask
 
 mkdir -p /opt/warpgateway
 
-echo -e "${YELLOW}---------------------------------------------------${NC}"
-echo -e "${YELLOW}   Dashboard Admin Credentials Setup               ${NC}"
-echo -e "${YELLOW}---------------------------------------------------${NC}"
-
-# Generate Secure Random Fallback Credentials
-RANDOM_USER="admin_$(head -c 4 /dev/urandom | hexdump -e '4/1 "%02x"')"
-RANDOM_PASS="$(head -c 8 /dev/urandom | hexdump -e '8/1 "%02x"')"
-
-if [ -t 0 ]; then
-    read -p "Enter Admin Username [Default: ${RANDOM_USER}]: " INPUT_USER
-    UI_USER=${INPUT_USER:-$RANDOM_USER}
-
-    read -sp "Enter Admin Password [Default: ${RANDOM_PASS}]: " INPUT_PASS
-    echo ""
-    UI_PASS=${INPUT_PASS:-$RANDOM_PASS}
+if [ -f /opt/warpgateway/credentials.json ] && [ -f /opt/warpgateway/config.py ]; then
+    log_info "Existing installation detected. Preserving credentials & system settings..."
+    EXISTING_USER=$(python3 -c "import json; print(json.load(open('/opt/warpgateway/credentials.json')).get('username', 'admin'))" 2>/dev/null || echo "admin")
+    UI_USER="$EXISTING_USER"
+    UI_PASS="[Unchanged - Existing Password Retained]"
 else
-    log_warn "Non-interactive shell detected. Generated secure random credentials."
-    UI_USER=$RANDOM_USER
-    UI_PASS=$RANDOM_PASS
-fi
+    echo -e "${YELLOW}---------------------------------------------------${NC}"
+    echo -e "${YELLOW}   Dashboard Admin Credentials Setup               ${NC}"
+    echo -e "${YELLOW}---------------------------------------------------${NC}"
 
-GEN_KEY=$(head -c 16 /dev/urandom | hexdump -e '16/1 "%02x"' 2>/dev/null || echo "warp_default_secret_key_99")
+    # Generate Secure Random Fallback Credentials
+    RANDOM_USER="admin_$(head -c 4 /dev/urandom | hexdump -e '4/1 "%02x"')"
+    RANDOM_PASS="$(head -c 8 /dev/urandom | hexdump -e '8/1 "%02x"')"
 
-# config.py now only holds the Flask secret key.
-# Admin credentials are stored separately (hashed) in credentials.json so they
-# can be changed at runtime from the dashboard without touching source files.
-cat << EOF > /opt/warpgateway/config.py
+    if [ -t 0 ]; then
+        read -p "Enter Admin Username [Default: ${RANDOM_USER}]: " INPUT_USER
+        UI_USER=${INPUT_USER:-$RANDOM_USER}
+
+        read -sp "Enter Admin Password [Default: ${RANDOM_PASS}]: " INPUT_PASS
+        echo ""
+        UI_PASS=${INPUT_PASS:-$RANDOM_PASS}
+    else
+        log_warn "Non-interactive shell detected. Generated secure random credentials."
+        UI_USER=$RANDOM_USER
+        UI_PASS=$RANDOM_PASS
+    fi
+
+    GEN_KEY=$(head -c 16 /dev/urandom | hexdump -e '16/1 "%02x"' 2>/dev/null || echo "warp_default_secret_key_99")
+
+    # config.py holds the Flask secret key
+    cat << EOF > /opt/warpgateway/config.py
 SECRET_KEY = "${GEN_KEY}"
 EOF
 
-# Seed the credentials file with a securely hashed password.
-python3 - "$UI_USER" "$UI_PASS" << 'PYEOF'
+    # Seed the credentials file with a securely hashed password.
+    python3 - "$UI_USER" "$UI_PASS" << 'PYEOF'
 import sys, json
 from werkzeug.security import generate_password_hash
 
@@ -141,7 +145,8 @@ with open("/opt/warpgateway/credentials.json", "w") as f:
     json.dump(data, f, indent=2)
 PYEOF
 
-chmod 600 /opt/warpgateway/credentials.json
+    chmod 600 /opt/warpgateway/credentials.json
+fi
 
 # Create Application Source Code
 # ---------------------------------------------------------------------------
