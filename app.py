@@ -72,6 +72,24 @@ def is_warp_connected():
     return "Connected" in get_warp_status()
 
 
+def wait_for_warp_state(want_connected, timeout=6, interval=0.5):
+    """
+    Block until warp-cli reports the expected connection state, or until
+    `timeout` seconds elapse. warp-cli returns immediately after issuing
+    connect/disconnect, but the actual Cloudflare handshake/teardown can take
+    a couple of seconds — without this, the dashboard redirect can land
+    before the state has actually changed, showing a stale badge.
+    Returns True if the state settled before the timeout, False otherwise.
+    """
+    elapsed = 0.0
+    while elapsed < timeout:
+        if is_warp_connected() == want_connected:
+            return True
+        time.sleep(interval)
+        elapsed += interval
+    return is_warp_connected() == want_connected
+
+
 def get_ip_forward_status():
     val = run_cmd("cat /proc/sys/net/ipv4/ip_forward").strip()
     return val == "1"
@@ -393,10 +411,18 @@ def dashboard():
 def toggle_warp(action):
     if action == "on":
         run_cmd("warp-cli --accept-tos connect")
-        flash("WARP connect command issued.", "success")
+        settled = wait_for_warp_state(True, timeout=6)
+        if settled:
+            flash("WARP connected.", "success")
+        else:
+            flash("Connect command sent — still establishing the tunnel, refresh in a few seconds.", "success")
     elif action == "off":
         run_cmd("warp-cli --accept-tos disconnect")
-        flash("WARP disconnect command issued.", "success")
+        settled = wait_for_warp_state(False, timeout=6)
+        if settled:
+            flash("WARP disconnected.", "success")
+        else:
+            flash("Disconnect command sent — still tearing down the tunnel, refresh in a few seconds.", "success")
     return redirect(url_for("dashboard"))
 
 
@@ -695,4 +721,8 @@ def guide():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    # threaded=True: toggle_warp() can block for up to a few seconds while it
+    # waits for the WARP daemon to settle. Without threading, that would
+    # freeze every other request (other users, other tabs) for the same
+    # duration on Flask's single-threaded dev server.
+    app.run(host="0.0.0.0", port=8080, threaded=True)
