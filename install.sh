@@ -144,6 +144,7 @@ import threading
 import time
 from functools import wraps
 from flask import Flask, render_template_string, request, redirect, url_for, session, flash
+from markupsafe import Markup
 from werkzeug.security import generate_password_hash, check_password_hash
 
 import config
@@ -241,7 +242,8 @@ ICONS = {
 
 
 def icon(name, size=18):
-    return f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{ICONS.get(name, "")}</svg>'
+    svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{ICONS.get(name, "")}</svg>'
+    return Markup(svg)
 
 
 app.jinja_env.globals.update(icon=icon)
