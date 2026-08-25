@@ -365,9 +365,18 @@ def ensure_firewall_nat():
     bypassed LAN traffic encounters asymmetric routing issues or dropped packets."""
     try:
         run_cmd("sysctl -w net.ipv4.ip_forward=1")
+        # Loose reverse-path filtering to prevent kernel from dropping bypassed LAN traffic
+        run_cmd("sysctl -w net.ipv4.conf.all.rp_filter=2")
+        run_cmd("sysctl -w net.ipv4.conf.default.rp_filter=2")
+        
+        # Block IPv6 forwarding to avoid IPv6 leaks via WARP tunnel
+        run_cmd("sysctl -w net.ipv6.conf.all.forwarding=0")
+        run_cmd("ip6tables -P FORWARD DROP 2>/dev/null || true")
+
         run_cmd("iptables -t nat -C POSTROUTING -o CloudflareWARP -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o CloudflareWARP -j MASQUERADE")
         iface, _ = detect_uplink()
         if iface:
+            run_cmd(f"sysctl -w net.ipv4.conf.{iface}.rp_filter=2")
             run_cmd(f"iptables -t nat -C POSTROUTING -o {iface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o {iface} -j MASQUERADE")
         run_cmd("iptables -t nat -C POSTROUTING -m addrtype ! --dst-type LOCAL -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -m addrtype ! --dst-type LOCAL -j MASQUERADE 2>/dev/null || true")
         run_cmd("iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT")
@@ -1580,7 +1589,8 @@ def bypass():
         {''.join(f'<button type="button" class="preset-btn" onclick="addPreset(this)" data-val="{v}">{v}</button>'
           for v in ['*.bkash.com','*.bka.sh','*.nagad.com.bd','*.cellfin.com.bd','*.upay.com.bd',
                     '*.dmoney.com.bd','*.dutchbanglabank.com','*.bracbank.com',
-                    '*.ibbl.com.bd','*.tapn.com.bd','*.shohoz.com','*.sslcommerz.com'])}
+                    '*.ibbl.com.bd','*.tapn.com.bd','*.shohoz.com','*.sslcommerz.com',
+                    '*.ipinfo.io','*.ip-api.com','*.api.ipify.org'])}
       </div>
       <form method="POST" action="{url_for('bypass_add')}">
         <div class="input-group">
