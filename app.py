@@ -2,9 +2,13 @@ import subprocess
 import os
 import json
 import re
+import socket
+import ipaddress
+import uuid
 import threading
 import time
 from functools import wraps
+from urllib.parse import urlparse
 from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
 from markupsafe import Markup
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -15,6 +19,8 @@ app = Flask(__name__)
 app.secret_key = config.SECRET_KEY
 
 CRED_FILE = "/opt/warpgateway/credentials.json"
+BYPASS_RULES_FILE = "/opt/warpgateway/bypass_rules.json"
+BYPASS_SETTINGS_FILE = "/opt/warpgateway/bypass_settings.json"
 SERVICE_NAME = "warpgateway"
 
 
@@ -98,6 +104,204 @@ def get_ip_forward_status():
 def delayed_restart():
     time.sleep(1)
     subprocess.run(["systemctl", "restart", SERVICE_NAME])
+
+
+# ---------------------------------------------------------------------------
+# Bypass Rules (Split Tunneling)
+#
+# Lets specific domains/IPs (bKash, Nagad, CellFin, other bank/fintech APIs)
+# skip the WARP tunnel entirely and go out directly over the real ISP
+# uplink, so those services see the genuine Bangladeshi IP instead of a
+# Cloudflare edge IP and stop flagging the login as "another country".
+#
+# Mechanism: for each bypassed destination we install a host route
+# (`ip route replace <ip>/32 via <uplink-gw> dev <uplink-iface>`). A /32 (or
+# an explicit CIDR) is always more specific than the tunnel's default route,
+# so the kernel sends that traffic straight out the physical interface no
+# matter what WARP's default route looks like — no need to touch WARP's own
+# routing table. Domain-based rules are periodically re-resolved in the
+# background, since bank/CDN IPs rotate.
+# ---------------------------------------------------------------------------
+def _load_json(path, default):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_bypass_rules():
+    return _load_json(BYPASS_RULES_FILE, [])
+
+
+def save_bypass_rules(rules):
+    _save_json(BYPASS_RULES_FILE, rules)
+
+
+def load_bypass_settings():
+    return _load_json(BYPASS_SETTINGS_FILE, {"iface": None, "gateway": None})
+
+
+def save_bypass_settings(settings):
+    _save_json(BYPASS_SETTINGS_FILE, settings)
+
+
+def _looks_like_ip_or_cidr(s):
+    try:
+        ipaddress.ip_network(s, strict=False)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_bypass_input(raw):
+    """Turn whatever the admin typed/pasted into a clean (kind, value) pair.
+    Accepts a bare domain ('api.bkash.com'), a full API URL
+    ('https://api.bkash.com/v1.2.0-beta/tokenized/checkout'), a bare IP, or
+    a CIDR block ('103.4.145.0/24')."""
+    raw = raw.strip()
+    if not raw:
+        return None, None
+
+    if "://" in raw:
+        host = urlparse(raw).hostname
+    elif _looks_like_ip_or_cidr(raw):
+        host = raw
+    else:
+        # A bare "domain.com/some/path" pasted without a scheme.
+        host = raw.split("/")[0]
+
+    if not host:
+        return None, None
+    host = host.strip().rstrip(".")
+
+    try:
+        net = ipaddress.ip_network(host, strict=False)
+        return ("cidr" if "/" in host else "ip"), str(net) if "/" in host else host
+    except ValueError:
+        pass
+
+    if re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$", host):
+        return "domain", host.lower()
+    return None, None
+
+
+def resolve_domain(domain):
+    try:
+        _, _, ips = socket.gethostbyname_ex(domain)
+        return sorted(set(ips))
+    except Exception:
+        return []
+
+
+def detect_uplink():
+    """Auto-detect the physical ISP interface + gateway to send bypassed
+    traffic out of (i.e. NOT the CloudflareWARP tunnel). A manual override
+    saved from the Bypass Rules page always wins if both fields are set."""
+    settings = load_bypass_settings()
+    if settings.get("iface") and settings.get("gateway"):
+        return settings["iface"], settings["gateway"]
+
+    out = run_cmd("ip route show table all")
+    for line in out.splitlines():
+        if "CloudflareWARP" in line or "warp" in line.lower():
+            continue
+        m = re.match(r"default via (\S+) dev (\S+)", line.strip())
+        if m:
+            return m.group(2), m.group(1)
+
+    # Fallback: probe every up interface (except lo/WARP) for its own
+    # per-device default route.
+    out = run_cmd("ip -o link show up")
+    for line in out.splitlines():
+        m = re.search(r"^\d+:\s+(\S+):", line)
+        if not m:
+            continue
+        iface = m.group(1)
+        if iface == "lo" or "warp" in iface.lower():
+            continue
+        gw_out = run_cmd(f"ip route show dev {iface} | grep default")
+        gm = re.search(r"default via (\S+)", gw_out)
+        if gm:
+            return iface, gm.group(1)
+    return None, None
+
+
+def _route_apply(ip_or_cidr, iface, gateway):
+    return run_cmd(f"ip route replace {ip_or_cidr} via {gateway} dev {iface}")
+
+
+def _route_remove(ip_or_cidr):
+    return run_cmd(f"ip route del {ip_or_cidr}")
+
+
+def apply_bypass_rule(rule):
+    """(Re)install kernel routes for one rule, in place. For domain rules
+    this re-resolves DNS first — any IP that dropped out of the fresh
+    answer has its route removed, any new IP gets one added."""
+    iface, gateway = detect_uplink()
+    rule["last_checked"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    if not iface or not gateway:
+        rule["status"] = "error"
+        rule["error"] = "Could not detect a physical uplink interface/gateway."
+        return rule
+
+    if rule["type"] == "domain":
+        new_ips = resolve_domain(rule["value"])
+        if not new_ips:
+            rule["status"] = "error"
+            rule["error"] = "DNS resolution failed."
+            return rule
+        old_ips = set(rule.get("resolved_ips", []))
+        for stale in old_ips - set(new_ips):
+            _route_remove(f"{stale}/32")
+        for ip in new_ips:
+            _route_apply(f"{ip}/32", iface, gateway)
+        rule["resolved_ips"] = new_ips
+    else:
+        target = rule["value"] if rule["type"] == "cidr" else f"{rule['value']}/32"
+        _route_apply(target, iface, gateway)
+        rule["resolved_ips"] = [rule["value"]]
+
+    rule["status"] = "active"
+    rule["error"] = None
+    rule["uplink_iface"] = iface
+    rule["uplink_gateway"] = gateway
+    return rule
+
+
+def remove_bypass_rule_routes(rule):
+    if rule["type"] == "domain":
+        for ip in rule.get("resolved_ips", []):
+            _route_remove(f"{ip}/32")
+    else:
+        target = rule["value"] if rule["type"] == "cidr" else f"{rule['value']}/32"
+        _route_remove(target)
+
+
+def apply_all_bypass_rules():
+    rules = load_bypass_rules()
+    for rule in rules:
+        apply_bypass_rule(rule)
+    save_bypass_rules(rules)
+    return rules
+
+
+def bypass_refresh_loop(interval=300):
+    """Background loop: periodically re-resolves domain-based bypass rules
+    so routes stay correct as banking/CDN IPs rotate over time."""
+    while True:
+        time.sleep(interval)
+        try:
+            apply_all_bypass_rules()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +683,7 @@ BASE = """
       </div>
       <a class="nav-item {{ 'active' if page=='dashboard' else '' }}" href="{{ url_for('dashboard') }}">{{ icon('home') }} Dashboard</a>
       <a class="nav-item {{ 'active' if page=='network' else '' }}" href="{{ url_for('network') }}">{{ icon('network') }} Network Info</a>
+      <a class="nav-item {{ 'active' if page=='bypass' else '' }}" href="{{ url_for('bypass') }}">{{ icon('shield') }} Bypass Rules</a>
       <a class="nav-item {{ 'active' if page=='logs' else '' }}" href="{{ url_for('logs') }}">{{ icon('logs') }} Service Logs</a>
       <a class="nav-item {{ 'active' if page=='system' else '' }}" href="{{ url_for('system') }}">{{ icon('server') }} System Config</a>
       <a class="nav-item {{ 'active' if page=='settings' else '' }}" href="{{ url_for('settings') }}">{{ icon('settings') }} Admin Settings</a>
@@ -855,6 +1060,208 @@ def network():
 
 
 # ---------------------------------------------------------------------------
+# Bypass Rules (Split Tunneling) page
+# ---------------------------------------------------------------------------
+@app.route("/bypass")
+@login_required
+def bypass():
+    rules = load_bypass_rules()
+    settings = load_bypass_settings()
+    auto_iface, auto_gateway = detect_uplink()
+
+    def status_badge(r):
+        st = r.get("status", "pending")
+        cls = "on" if st == "active" else ("off" if st == "error" else "mode")
+        return f'<span class="badge {cls}">{st.upper()}</span>'
+
+    rows = ""
+    if not rules:
+        rows = ('<tr><td colspan="5" style="padding:14px 0;color:var(--muted);">'
+                'No bypass rules yet — add a bank/fintech domain, URL, IP or CIDR below.</td></tr>')
+    else:
+        for r in rules:
+            ips = ", ".join(r.get("resolved_ips", [])) or "—"
+            err = f"<div style='color:#fca5a5;font-size:11.5px;margin-top:2px;'>{r['error']}</div>" if r.get("error") else ""
+            rows += f"""
+            <tr>
+              <td style="padding:10px 0;">{r['type'].upper()}</td>
+              <td style="padding:10px 0;font-weight:600;">{r['value']}</td>
+              <td style="padding:10px 0;color:var(--muted);font-size:12.5px;">{ips}{err}</td>
+              <td style="padding:10px 0;">{status_badge(r)}</td>
+              <td style="padding:10px 0;text-align:right;white-space:nowrap;">
+                <form method="POST" action="{url_for('bypass_refresh', rule_id=r['id'])}" style="display:inline;">
+                  <button class="btn btn-outline btn-sm">{icon('activity',14)} Refresh</button>
+                </form>
+                <form method="POST" action="{url_for('bypass_delete', rule_id=r['id'])}" style="display:inline;" onsubmit="return confirm('Remove this bypass rule?');">
+                  <button class="btn btn-danger btn-sm">Remove</button>
+                </form>
+              </td>
+            </tr>
+            """
+
+    content = f"""
+    <div class="card" style="margin-bottom:16px;">
+      <h3>{icon('network')} Uplink Used For Bypassed Traffic</h3>
+      <div class="info-row"><span class="label">Auto-detected Interface</span><span class="value">{auto_iface or 'Not found'}</span></div>
+      <div class="info-row"><span class="label">Auto-detected Gateway</span><span class="value">{auto_gateway or 'Not found'}</span></div>
+      <p style="color:var(--muted);font-size:12.5px;margin:10px 0;">Bypassed domains/IPs are routed out through this interface instead of the CloudflareWARP tunnel. Leave the fields below blank to keep auto-detection, or set them manually if auto-detection ever picks the wrong interface.</p>
+      <form method="POST" action="{url_for('bypass_uplink')}">
+        <div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:10px;">
+          <div class="input-group" style="margin-bottom:0;">
+            <label>Manual Interface (optional)</label>
+            <input type="text" name="iface" placeholder="e.g. eth0" value="{settings.get('iface') or ''}">
+          </div>
+          <div class="input-group" style="margin-bottom:0;">
+            <label>Manual Gateway IP (optional)</label>
+            <input type="text" name="gateway" placeholder="e.g. 192.168.1.1" value="{settings.get('gateway') or ''}">
+          </div>
+        </div>
+        <button class="btn btn-outline" style="width:auto;padding:10px 16px;">{icon('check',14)} Save Uplink Override</button>
+      </form>
+    </div>
+
+    <div class="card" style="margin-bottom:16px;">
+      <h3>{icon('shield')} Add Bypass Rule</h3>
+      <p style="color:var(--muted);font-size:12.5px;margin-bottom:12px;">
+        Paste a domain (<code>bkash.com</code>), a full API URL (<code>https://api.nagad.com.bd/remote-payment-gateway-1.0</code>), a bare IP, or a CIDR block — the hostname/IP is extracted automatically. Add several at once: one per line, or comma-separated.
+      </p>
+      <form method="POST" action="{url_for('bypass_add')}">
+        <div class="input-group">
+          <label>Domains / URLs / IPs / CIDRs</label>
+          <textarea name="entries" rows="4" placeholder="bkash.com&#10;https://apigw.nagad.com.bd/remote-payment-gateway-1.0&#10;103.4.145.0/24" style="width:100%;padding:11px 12px;background:var(--panel-2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:14px;font-family:inherit;resize:vertical;"></textarea>
+        </div>
+        <button class="btn btn-primary" style="width:auto;padding:11px 20px;">{icon('check',16)} Add &amp; Apply Bypass</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h3>{icon('network')} Active Bypass Rules <span class="badge mode">{len(rules)}</span></h3>
+      <div class="btn-row" style="margin-bottom:14px;">
+        <form method="POST" action="{url_for('bypass_refresh_all')}">
+          <button class="btn btn-outline btn-sm">{icon('activity',14)} Re-apply / Re-resolve All</button>
+        </form>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <thead>
+          <tr style="text-align:left;color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;">
+            <th style="padding-bottom:8px;">Type</th>
+            <th style="padding-bottom:8px;">Entry</th>
+            <th style="padding-bottom:8px;">Resolved IP(s)</th>
+            <th style="padding-bottom:8px;">Status</th>
+            <th style="padding-bottom:8px;text-align:right;">Actions</th>
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </div>
+    """
+    return render_page("bypass", "Bypass Rules", "Split-tunnel specific domains/IPs around the WARP tunnel", content)
+
+
+@app.route("/bypass/add", methods=["POST"])
+@login_required
+def bypass_add():
+    raw = request.form.get("entries", "")
+    entries = [e.strip() for chunk in raw.splitlines() for e in chunk.split(",") if e.strip()]
+    if not entries:
+        flash("Enter at least one domain, URL, IP, or CIDR.", "error")
+        return redirect(url_for("bypass"))
+
+    rules = load_bypass_rules()
+    existing_values = {(r["type"], r["value"]) for r in rules}
+    added, skipped, invalid = 0, 0, 0
+
+    for raw_entry in entries:
+        kind, value = parse_bypass_input(raw_entry)
+        if not kind:
+            invalid += 1
+            continue
+        if (kind, value) in existing_values:
+            skipped += 1
+            continue
+        rule = {
+            "id": uuid.uuid4().hex[:10],
+            "type": kind,
+            "value": value,
+            "resolved_ips": [],
+            "status": "pending",
+            "error": None,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "last_checked": None,
+        }
+        apply_bypass_rule(rule)
+        rules.append(rule)
+        existing_values.add((kind, value))
+        added += 1
+
+    save_bypass_rules(rules)
+
+    msg = f"Added {added} bypass rule(s)."
+    if skipped:
+        msg += f" Skipped {skipped} duplicate(s)."
+    if invalid:
+        msg += f" Could not parse {invalid} entr{'y' if invalid == 1 else 'ies'} — check the format."
+    flash(msg, "success" if added else "error")
+    return redirect(url_for("bypass"))
+
+
+@app.route("/bypass/refresh/<rule_id>", methods=["POST"])
+@login_required
+def bypass_refresh(rule_id):
+    rules = load_bypass_rules()
+    found = False
+    for r in rules:
+        if r["id"] == rule_id:
+            apply_bypass_rule(r)
+            flash(f"Re-applied bypass rule for {r['value']}.", "success")
+            found = True
+            break
+    if not found:
+        flash("Rule not found.", "error")
+    save_bypass_rules(rules)
+    return redirect(url_for("bypass"))
+
+
+@app.route("/bypass/refresh-all", methods=["POST"])
+@login_required
+def bypass_refresh_all():
+    apply_all_bypass_rules()
+    flash("All bypass rules re-applied.", "success")
+    return redirect(url_for("bypass"))
+
+
+@app.route("/bypass/delete/<rule_id>", methods=["POST"])
+@login_required
+def bypass_delete(rule_id):
+    rules = load_bypass_rules()
+    keep = []
+    removed_value = None
+    for r in rules:
+        if r["id"] == rule_id:
+            remove_bypass_rule_routes(r)
+            removed_value = r["value"]
+        else:
+            keep.append(r)
+    save_bypass_rules(keep)
+    if removed_value:
+        flash(f"Removed bypass rule for {removed_value}.", "success")
+    else:
+        flash("Rule not found.", "error")
+    return redirect(url_for("bypass"))
+
+
+@app.route("/bypass/uplink", methods=["POST"])
+@login_required
+def bypass_uplink():
+    iface = request.form.get("iface", "").strip()
+    gateway = request.form.get("gateway", "").strip()
+    save_bypass_settings({"iface": iface or None, "gateway": gateway or None})
+    flash("Uplink override saved — re-applying existing rules...", "success")
+    apply_all_bypass_rules()
+    return redirect(url_for("bypass"))
+
+
+# ---------------------------------------------------------------------------
 # Logs
 # ---------------------------------------------------------------------------
 @app.route("/logs")
@@ -1081,6 +1488,17 @@ def guide():
 
 
 if __name__ == "__main__":
+    # Bypass routes (see the "Bypass Rules" section above) live in the
+    # kernel routing table, not in a config file the kernel reads on its
+    # own — so on every service start/restart we need to re-install them
+    # from bypass_rules.json, then keep a background thread re-resolving
+    # domain-based rules so routes track IP changes over time.
+    try:
+        apply_all_bypass_rules()
+    except Exception:
+        pass
+    threading.Thread(target=bypass_refresh_loop, daemon=True).start()
+
     # threaded=True: toggle_warp() can block for up to a few seconds while it
     # waits for the WARP daemon to settle. Without threading, that would
     # freeze every other request (other users, other tabs) for the same
