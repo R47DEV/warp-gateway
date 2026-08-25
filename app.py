@@ -219,6 +219,9 @@ COMMON_SUBDOMAINS = [
     "services", "service", "cdn", "static", "assets", "media",
     "prod", "live", "ws", "web", "img", "images", "s",
     "ssl", "checkout", "transaction", "wallet", "card", "v1", "v2",
+    # Specific known complex subdomains for BD Fintech (bKash etc.)
+    "capp", "api.cde.capp", "eventapi.capp", "images.capp",
+    "analytics", "campaign-images.analytics", "trace", "log", "metrics"
 ]
 
 
@@ -467,6 +470,10 @@ _CDN_PROVIDERS = {
         "name": "AWS CloudFront",
         "description": "Used by Nagad, mobile banking backends (~300 IPv4 ranges)",
     },
+    "aws_asia": {
+        "name": "AWS Asia (Singapore/Mumbai)",
+        "description": "Crucial for bKash backend EC2 servers & BD startups (~800 IPv4 ranges)",
+    },
 }
 
 
@@ -475,6 +482,7 @@ def load_cdn_settings():
         "providers": {
             "cloudflare":     {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
             "aws_cloudfront": {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
+            "aws_asia":       {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
         }
     }
     return _load_json(CDN_SETTINGS_FILE, defaults)
@@ -515,6 +523,23 @@ def _fetch_aws_cloudfront_cidrs():
         return exc
 
 
+def _fetch_aws_asia_cidrs():
+    """Fetch AWS ip-ranges.json and extract EC2 regions for Singapore and Mumbai."""
+    try:
+        import urllib.request, json as _json
+        with urllib.request.urlopen(
+            "https://ip-ranges.amazonaws.com/ip-ranges.json", timeout=15
+        ) as resp:
+            data = _json.loads(resp.read())
+        return [
+            p["ip_prefix"]
+            for p in data.get("prefixes", [])
+            if p.get("region") in ("ap-southeast-1", "ap-south-1")
+        ]
+    except Exception as exc:
+        return exc
+
+
 def _apply_cdn_cidrs(cidrs):
     """Install bypass routes + warp-cli entries for a list of CIDRs.
     Returns number of successfully processed routes."""
@@ -538,6 +563,7 @@ def sync_cdn_provider(provider_key):
     fetchers = {
         "cloudflare":     _fetch_cloudflare_cidrs,
         "aws_cloudfront": _fetch_aws_cloudfront_cidrs,
+        "aws_asia":       _fetch_aws_asia_cidrs,
     }
     fn = fetchers.get(provider_key)
     if fn is None:
