@@ -474,6 +474,10 @@ _CDN_PROVIDERS = {
         "name": "AWS Asia (Singapore/Mumbai)",
         "description": "Crucial for bKash backend EC2 servers & BD startups (~800 IPv4 ranges)",
     },
+    "bd_national": {
+        "name": "Bangladesh National IPs",
+        "description": "Bypass ALL local BD traffic (BDIX, Banks, ISP caches). Recommended! (~2300 IPv4 ranges)",
+    },
 }
 
 
@@ -483,6 +487,7 @@ def load_cdn_settings():
             "cloudflare":     {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
             "aws_cloudfront": {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
             "aws_asia":       {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
+            "bd_national":    {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
         }
     }
     return _load_json(CDN_SETTINGS_FILE, defaults)
@@ -540,6 +545,22 @@ def _fetch_aws_asia_cidrs():
         return exc
 
 
+def _fetch_bd_national_cidrs():
+    """Fetch all IPv4 ranges assigned to Bangladesh from RIPE stat API."""
+    try:
+        import urllib.request, json as _json
+        req = urllib.request.Request(
+            "https://stat.ripe.net/data/country-resource-list/data.json?resource=BD",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = _json.loads(resp.read())
+        ipv4_list = data.get("data", {}).get("resources", {}).get("ipv4", [])
+        return [cidr for cidr in ipv4_list if "/" in cidr]
+    except Exception as exc:
+        return exc
+
+
 def _apply_cdn_cidrs(cidrs):
     """Install bypass routes + warp-cli entries for a list of CIDRs.
     Returns number of successfully processed routes."""
@@ -564,6 +585,7 @@ def sync_cdn_provider(provider_key):
         "cloudflare":     _fetch_cloudflare_cidrs,
         "aws_cloudfront": _fetch_aws_cloudfront_cidrs,
         "aws_asia":       _fetch_aws_asia_cidrs,
+        "bd_national":    _fetch_bd_national_cidrs,
     }
     fn = fetchers.get(provider_key)
     if fn is None:
