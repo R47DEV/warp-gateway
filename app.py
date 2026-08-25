@@ -18,10 +18,11 @@ import config
 app = Flask(__name__)
 app.secret_key = config.SECRET_KEY
 
-CRED_FILE = "/opt/warpgateway/credentials.json"
-BYPASS_RULES_FILE = "/opt/warpgateway/bypass_rules.json"
+CRED_FILE            = "/opt/warpgateway/credentials.json"
+BYPASS_RULES_FILE    = "/opt/warpgateway/bypass_rules.json"
 BYPASS_SETTINGS_FILE = "/opt/warpgateway/bypass_settings.json"
-SERVICE_NAME = "warpgateway"
+CDN_SETTINGS_FILE    = "/opt/warpgateway/cdn_settings.json"
+SERVICE_NAME         = "warpgateway"
 
 
 # ---------------------------------------------------------------------------
@@ -161,11 +162,22 @@ def _looks_like_ip_or_cidr(s):
 
 def parse_bypass_input(raw):
     """Turn whatever the admin typed/pasted into a clean (kind, value) pair.
-    Accepts a bare domain ('api.bkash.com'), a full API URL
-    ('https://api.bkash.com/v1.2.0-beta/tokenized/checkout'), a bare IP, or
-    a CIDR block ('103.4.145.0/24')."""
+    Accepts:
+      - Bare domain:     'api.bkash.com'
+      - Full API URL:    'https://api.bkash.com/v1.2.0-beta/tokenized/'
+      - Wildcard:        '*.bkash.com'  →  type='wildcard', value='bkash.com'
+      - Bare IP:         '103.4.145.5'
+      - CIDR block:      '103.4.145.0/24'
+    """
     raw = raw.strip()
     if not raw:
+        return None, None
+
+    # Wildcard pattern: *.domain.com or *domain.com
+    if raw.startswith("*"):
+        apex = raw.lstrip("*.").strip().lower()
+        if apex and re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$", apex):
+            return "wildcard", apex
         return None, None
 
     if "://" in raw:
@@ -197,6 +209,101 @@ def resolve_domain(domain):
         return sorted(set(ips))
     except Exception:
         return []
+
+
+# Common subdomain prefixes probed for wildcard rules. These cover the most
+# frequently used subdomains for banking/fintech APIs in Bangladesh.
+COMMON_SUBDOMAINS = [
+    "", "www", "api", "app", "m", "mobile", "pgw", "pay", "payment",
+    "secure", "gateway", "portal", "auth", "login", "accounts",
+    "services", "service", "cdn", "static", "assets", "media",
+    "prod", "live", "ws", "web", "img", "images", "s",
+    "ssl", "checkout", "transaction", "wallet", "card", "v1", "v2",
+]
+
+
+def resolve_wildcard_domain(apex):
+    """Resolve an apex domain plus common subdomains so a wildcard bypass rule
+    covers as many real IPs as possible without needing to know exact subdomains
+    in advance. Duplicate IPs (shared CDN anycast addresses) are de-duplicated."""
+    all_ips = set()
+    for sub in COMMON_SUBDOMAINS:
+        fqdn = apex if not sub else f"{sub}.{apex}"
+        try:
+            _, _, ips = socket.gethostbyname_ex(fqdn)
+            all_ips.update(ips)
+        except Exception:
+            pass
+    return sorted(all_ips)
+
+
+# ---------------------------------------------------------------------------
+# WARP Native Split-Tunnel Helpers
+#
+# `warp-cli split-tunnel` is the preferred bypass mechanism — it tells the
+# WARP daemon itself to exclude a host/IP from the encrypted tunnel so it
+# survives WARP reconnects and doesn't depend on fragile kernel route state.
+# We probe which command format the installed warp-cli version supports and
+# fall back gracefully to ip-route-only mode if unavailable.
+# ---------------------------------------------------------------------------
+_warp_st_support = None   # None = not yet probed; "v2" | "legacy" | False
+
+
+def _probe_warp_split_tunnel():
+    """One-time probe: discover which split-tunnel API the installed warp-cli
+    supports. Result is cached so we only shell out once per process."""
+    global _warp_st_support
+    if _warp_st_support is not None:
+        return _warp_st_support
+    # Modern warp-cli (>= 2022.x) uses `warp-cli split-tunnel list`
+    out = run_cmd("warp-cli --accept-tos split-tunnel list 2>&1", timeout=5)
+    if out and "error" not in out.lower() and "unknown" not in out.lower() and "invalid" not in out.lower():
+        _warp_st_support = "v2"
+        return _warp_st_support
+    # Older clients expose `warp-cli add-excluded-route`
+    out2 = run_cmd("warp-cli add-excluded-route --help 2>&1", timeout=5)
+    if "usage" in out2.lower() or "excluded" in out2.lower():
+        _warp_st_support = "legacy"
+        return _warp_st_support
+    _warp_st_support = False
+    return False
+
+
+def warp_st_add(target, is_host=False):
+    """Add *target* to WARP split-tunnel exclusions. Returns True on success.
+    is_host=True uses --host flag so warp-cli handles all subdomains natively."""
+    mode = _probe_warp_split_tunnel()
+    if mode == "v2":
+        flag = "--host" if is_host else "--ip"
+        out = run_cmd(f"warp-cli --accept-tos split-tunnel add {flag} {target} 2>&1", timeout=10)
+        return "error" not in out.lower() and "failed" not in out.lower()
+    if mode == "legacy" and not is_host:
+        out = run_cmd(f"warp-cli --accept-tos add-excluded-route {target} 2>&1", timeout=10)
+        return "error" not in out.lower()
+    return False
+
+
+def warp_st_remove(target, is_host=False):
+    """Remove *target* from WARP split-tunnel exclusions (best-effort)."""
+    mode = _probe_warp_split_tunnel()
+    if mode == "v2":
+        flag = "--host" if is_host else "--ip"
+        run_cmd(f"warp-cli --accept-tos split-tunnel remove {flag} {target} 2>&1", timeout=10)
+    elif mode == "legacy" and not is_host:
+        run_cmd(f"warp-cli --accept-tos remove-excluded-route {target} 2>&1", timeout=10)
+
+
+def warp_st_list():
+    """Return raw warp-cli split-tunnel list output string (for display)."""
+    mode = _probe_warp_split_tunnel()
+    if mode == "v2":
+        return run_cmd("warp-cli --accept-tos split-tunnel list 2>&1", timeout=10)
+    return ""
+
+
+def warp_st_supported():
+    """True if warp-cli split-tunnel is available on this system."""
+    return _probe_warp_split_tunnel() is not False
 
 
 def detect_uplink():
@@ -241,9 +348,17 @@ def _route_remove(ip_or_cidr):
 
 
 def apply_bypass_rule(rule):
-    """(Re)install kernel routes for one rule, in place. For domain rules
-    this re-resolves DNS first — any IP that dropped out of the fresh
-    answer has its route removed, any new IP gets one added."""
+    """(Re)install kernel routes + WARP split-tunnel entries for one rule.
+
+    Strategy (most-reliable-first):
+      1. warp-cli split-tunnel add --host <domain>  ← survives WARP reconnects
+      2. ip route replace <ip>/32 via <uplink-gw>   ← belt-and-suspenders
+
+    Domain and wildcard rules re-resolve DNS so stale routes for IPs that
+    have dropped out of the CDN's answer set are cleaned up proactively.
+    Wildcard rules also probe common subdomains to cover CDN endpoints that
+    don't appear in the root domain's DNS answer.
+    """
     iface, gateway = detect_uplink()
     rule["last_checked"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -261,28 +376,54 @@ def apply_bypass_rule(rule):
         old_ips = set(rule.get("resolved_ips", []))
         for stale in old_ips - set(new_ips):
             _route_remove(f"{stale}/32")
+            warp_st_remove(f"{stale}/32")
         for ip in new_ips:
             _route_apply(f"{ip}/32", iface, gateway)
+            warp_st_add(f"{ip}/32")
+        # Domain-level warp-cli exclusion covers future IP rotations natively
+        warp_st_add(rule["value"], is_host=True)
         rule["resolved_ips"] = new_ips
-    else:
+
+    elif rule["type"] == "wildcard":
+        apex = rule["value"]
+        new_ips = resolve_wildcard_domain(apex)
+        old_ips = set(rule.get("resolved_ips", []))
+        for stale in old_ips - set(new_ips):
+            _route_remove(f"{stale}/32")
+            warp_st_remove(f"{stale}/32")
+        for ip in new_ips:
+            _route_apply(f"{ip}/32", iface, gateway)
+            warp_st_add(f"{ip}/32")
+        # warp-cli host exclusion handles all subdomains automatically
+        warp_st_add(apex, is_host=True)
+        rule["resolved_ips"] = new_ips
+
+    else:  # ip or cidr
         target = rule["value"] if rule["type"] == "cidr" else f"{rule['value']}/32"
         _route_apply(target, iface, gateway)
+        warp_st_add(target)
         rule["resolved_ips"] = [rule["value"]]
 
-    rule["status"] = "active"
-    rule["error"] = None
+    rule["status"]       = "active"
+    rule["error"]        = None
     rule["uplink_iface"] = iface
     rule["uplink_gateway"] = gateway
+    rule["warp_cli_ok"]  = warp_st_supported()
     return rule
 
 
 def remove_bypass_rule_routes(rule):
-    if rule["type"] == "domain":
+    """Remove kernel routes AND WARP split-tunnel entries for one rule."""
+    if rule["type"] in ("domain", "wildcard"):
         for ip in rule.get("resolved_ips", []):
             _route_remove(f"{ip}/32")
+            warp_st_remove(f"{ip}/32")
+        # Remove the domain-level warp-cli host exclusion too
+        warp_st_remove(rule["value"], is_host=True)
     else:
         target = rule["value"] if rule["type"] == "cidr" else f"{rule['value']}/32"
         _route_remove(target)
+        warp_st_remove(target)
 
 
 def apply_all_bypass_rules():
@@ -293,13 +434,151 @@ def apply_all_bypass_rules():
     return rules
 
 
-def bypass_refresh_loop(interval=300):
-    """Background loop: periodically re-resolves domain-based bypass rules
-    so routes stay correct as banking/CDN IPs rotate over time."""
+def bypass_refresh_loop(interval=180):
+    """Background loop: re-resolves domain/wildcard bypass rules every 3 min
+    so ip routes + warp-cli exclusions track CDN IP rotations in near-real-time.
+    3-minute interval is aggressive enough for fast CDN IP churn (bKash, Nagad)
+    while still being cheap on DNS queries."""
     while True:
         time.sleep(interval)
         try:
             apply_all_bypass_rules()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# CDN IP-Range Auto-Sync
+#
+# Major cloud CDNs publish authoritative CIDR lists. When enabled for a
+# provider, we fetch these hourly and install bypass routes so that any
+# banking/fintech app served via those CDNs is automatically covered — even
+# when their backend IPs rotate or new subdomains are added.
+#
+# Cloudflare:     ~15 IPv4 ranges  (bKash, many fintech APIs)
+# AWS CloudFront: ~300 IPv4 ranges (Nagad, mobile banking backends)
+# ---------------------------------------------------------------------------
+_CDN_PROVIDERS = {
+    "cloudflare": {
+        "name": "Cloudflare CDN",
+        "description": "Used by bKash and many fintech APIs (~15 IPv4 ranges)",
+    },
+    "aws_cloudfront": {
+        "name": "AWS CloudFront",
+        "description": "Used by Nagad, mobile banking backends (~300 IPv4 ranges)",
+    },
+}
+
+
+def load_cdn_settings():
+    defaults = {
+        "providers": {
+            "cloudflare":     {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
+            "aws_cloudfront": {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
+        }
+    }
+    return _load_json(CDN_SETTINGS_FILE, defaults)
+
+
+def save_cdn_settings(settings):
+    _save_json(CDN_SETTINGS_FILE, settings)
+
+
+def _fetch_cloudflare_cidrs():
+    """Fetch Cloudflare's officially published IPv4 CIDR list."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen("https://www.cloudflare.com/ips-v4", timeout=10) as resp:
+            return [ln.strip() for ln in resp.read().decode().splitlines() if ln.strip()]
+    except Exception as exc:
+        return exc
+
+
+def _fetch_aws_cloudfront_cidrs():
+    """Fetch AWS ip-ranges.json and extract CloudFront service prefixes only."""
+    try:
+        import urllib.request, json as _json
+        with urllib.request.urlopen(
+            "https://ip-ranges.amazonaws.com/ip-ranges.json", timeout=15
+        ) as resp:
+            data = _json.loads(resp.read())
+        return [
+            p["ip_prefix"]
+            for p in data.get("prefixes", [])
+            if p.get("service") == "CLOUDFRONT"
+        ]
+    except Exception as exc:
+        return exc
+
+
+def _apply_cdn_cidrs(cidrs):
+    """Install bypass routes + warp-cli entries for a list of CIDRs.
+    Returns number of successfully processed routes."""
+    iface, gateway = detect_uplink()
+    count = 0
+    for cidr in cidrs:
+        try:
+            ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        warp_st_add(cidr)
+        if iface and gateway:
+            _route_apply(cidr, iface, gateway)
+        count += 1
+    return count
+
+
+def sync_cdn_provider(provider_key):
+    """Fetch and apply routes for one CDN provider.
+    Returns (cidr_count, error_string). error_string is None on success."""
+    fetchers = {
+        "cloudflare":     _fetch_cloudflare_cidrs,
+        "aws_cloudfront": _fetch_aws_cloudfront_cidrs,
+    }
+    fn = fetchers.get(provider_key)
+    if fn is None:
+        return 0, "Unknown provider."
+    result = fn()
+    if isinstance(result, Exception):
+        return 0, str(result)
+    if not result:
+        return 0, "Provider returned an empty IP list — check network connectivity."
+    count = _apply_cdn_cidrs(result)
+    return count, None
+
+
+def _cdn_sync_one(key):
+    """Sync a single CDN provider and persist results. Designed to run in a
+    daemon thread so it never blocks an HTTP request."""
+    try:
+        count, err = sync_cdn_provider(key)
+        settings = load_cdn_settings()
+        prov = settings["providers"].setdefault(key, {})
+        prov["last_sync"]  = time.strftime("%Y-%m-%d %H:%M:%S")
+        prov["cidr_count"] = count
+        prov["error"]      = err
+        save_cdn_settings(settings)
+    except Exception:
+        pass
+
+
+def cdn_sync_loop(interval=3600):
+    """Background thread: syncs enabled CDN providers every hour."""
+    while True:
+        time.sleep(interval)
+        try:
+            settings = load_cdn_settings()
+            changed = False
+            for key, prov in settings.get("providers", {}).items():
+                if not prov.get("enabled"):
+                    continue
+                count, err = sync_cdn_provider(key)
+                prov["last_sync"]  = time.strftime("%Y-%m-%d %H:%M:%S")
+                prov["cidr_count"] = count
+                prov["error"]      = err
+                changed = True
+            if changed:
+                save_cdn_settings(settings)
         except Exception:
             pass
 
@@ -1065,76 +1344,170 @@ def network():
 @app.route("/bypass")
 @login_required
 def bypass():
-    rules = load_bypass_rules()
-    settings = load_bypass_settings()
+    rules        = load_bypass_rules()
+    settings     = load_bypass_settings()
+    cdn_settings = load_cdn_settings()
     auto_iface, auto_gateway = detect_uplink()
+    warp_cli_ok  = warp_st_supported()
+
+    # ── Type badge colours ────────────────────────────────────────────────
+    TYPE_BADGE = {
+        "domain":   ("mode",  "DOMAIN"),
+        "wildcard": ("on",    "WILDCARD ✦"),
+        "ip":       ("mode",  "IP"),
+        "cidr":     ("mode",  "CIDR"),
+    }
 
     def status_badge(r):
-        st = r.get("status", "pending")
+        st  = r.get("status", "pending")
         cls = "on" if st == "active" else ("off" if st == "error" else "mode")
         return f'<span class="badge {cls}">{st.upper()}</span>'
 
+    # ── Active bypass rules table rows ────────────────────────────────────
     rows = ""
     if not rules:
         rows = ('<tr><td colspan="5" style="padding:14px 0;color:var(--muted);">'
-                'No bypass rules yet — add a bank/fintech domain, URL, IP or CIDR below.</td></tr>')
+                'No bypass rules yet — add bank/fintech domains below.</td></tr>')
     else:
         for r in rules:
-            ips = ", ".join(r.get("resolved_ips", [])) or "—"
-            err = f"<div style='color:#fca5a5;font-size:11.5px;margin-top:2px;'>{r['error']}</div>" if r.get("error") else ""
+            ips      = ", ".join(r.get("resolved_ips", [])) or "—"
+            err      = (f"<div style='color:#fca5a5;font-size:11.5px;margin-top:2px;'>{r['error']}</div>"
+                        if r.get("error") else "")
+            tb_cls, tb_label = TYPE_BADGE.get(r["type"], ("mode", r["type"].upper()))
+            warp_dot = (f'<span title="warp-cli split-tunnel active" '
+                        f'style="color:var(--green);font-size:10px;margin-left:4px;">⬤ WARP</span>'
+                        if r.get("warp_cli_ok") else "")
             rows += f"""
             <tr>
-              <td style="padding:10px 0;">{r['type'].upper()}</td>
-              <td style="padding:10px 0;font-weight:600;">{r['value']}</td>
+              <td style="padding:10px 0;"><span class="badge {tb_cls}">{tb_label}</span></td>
+              <td style="padding:10px 0;font-weight:600;">{r['value']}{warp_dot}</td>
               <td style="padding:10px 0;color:var(--muted);font-size:12.5px;">{ips}{err}</td>
               <td style="padding:10px 0;">{status_badge(r)}</td>
               <td style="padding:10px 0;text-align:right;white-space:nowrap;">
                 <form method="POST" action="{url_for('bypass_refresh', rule_id=r['id'])}" style="display:inline;">
                   <button class="btn btn-outline btn-sm">{icon('activity',14)} Refresh</button>
                 </form>
-                <form method="POST" action="{url_for('bypass_delete', rule_id=r['id'])}" style="display:inline;" onsubmit="return confirm('Remove this bypass rule?');">
+                <form method="POST" action="{url_for('bypass_delete', rule_id=r['id'])}" style="display:inline;"
+                      onsubmit="return confirm('Remove this bypass rule?');">
                   <button class="btn btn-danger btn-sm">Remove</button>
                 </form>
               </td>
             </tr>
             """
 
+    # ── CDN providers table rows ──────────────────────────────────────────
+    cdn_rows = ""
+    for key, meta in _CDN_PROVIDERS.items():
+        prov        = cdn_settings.get("providers", {}).get(key, {})
+        enabled     = prov.get("enabled", False)
+        last_sync   = prov.get("last_sync") or "Never"
+        cidr_count  = prov.get("cidr_count", 0)
+        cdn_err     = prov.get("error")
+        status_txt  = f"{cidr_count} CIDRs applied" if not cdn_err else f"Error: {cdn_err[:60]}"
+        badge_cls   = "on" if (enabled and not cdn_err) else ("off" if cdn_err else "mode")
+        cdn_rows += f"""
+        <tr>
+          <td style="padding:10px 0;font-weight:600;">{meta['name']}</td>
+          <td style="padding:10px 0;color:var(--muted);font-size:12.5px;">{meta['description']}</td>
+          <td style="padding:10px 0;"><span class="badge {badge_cls}">{'ENABLED' if enabled else 'DISABLED'}</span></td>
+          <td style="padding:10px 0;color:var(--muted);font-size:12px;">{status_txt}<br>
+              <span style="font-size:11px;">Last sync: {last_sync}</span></td>
+          <td style="padding:10px 0;text-align:right;white-space:nowrap;">
+            <form method="POST" action="{url_for('cdn_toggle', key=key)}" style="display:inline;">
+              <button class="btn {'btn-danger' if enabled else 'btn-primary'} btn-sm">{'Disable' if enabled else 'Enable'}</button>
+            </form>
+            <form method="POST" action="{url_for('cdn_sync_now', key=key)}" style="display:inline;">
+              <button class="btn btn-outline btn-sm">{icon('activity',14)} Sync Now</button>
+            </form>
+          </td>
+        </tr>
+        """
+
+    # ── WARP CLI status banner ────────────────────────────────────────────
+    warp_banner = (
+        f'<div style="display:flex;align-items:center;gap:8px;font-size:12.5px;'
+        f'color:var(--green);margin-bottom:14px;">'
+        f'{icon("check",14)} <strong>warp-cli split-tunnel active</strong> — bypass rules are '
+        f'applied at the WARP daemon level (most reliable, survives reconnects) AND via ip route.</div>'
+        if warp_cli_ok else
+        f'<div style="display:flex;align-items:center;gap:8px;font-size:12.5px;'
+        f'color:var(--amber);margin-bottom:14px;">'
+        f'⚠ warp-cli split-tunnel not available — using ip route only. '
+        f'Routes will be re-applied every 3 minutes.</div>'
+    )
+
     content = f"""
+    <style>
+      .preset-btn{{display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border-radius:8px;
+        background:rgba(79,142,247,.1);border:1px solid rgba(79,142,247,.3);color:#a5c8ff;
+        font-size:12px;font-weight:600;cursor:pointer;transition:.15s;}}
+      .preset-btn:hover{{background:rgba(79,142,247,.2);}}
+    </style>
+
+    <!-- CDN Auto-Sync Card -->
     <div class="card" style="margin-bottom:16px;">
-      <h3>{icon('network')} Uplink Used For Bypassed Traffic</h3>
-      <div class="info-row"><span class="label">Auto-detected Interface</span><span class="value">{auto_iface or 'Not found'}</span></div>
-      <div class="info-row"><span class="label">Auto-detected Gateway</span><span class="value">{auto_gateway or 'Not found'}</span></div>
-      <p style="color:var(--muted);font-size:12.5px;margin:10px 0;">Bypassed domains/IPs are routed out through this interface instead of the CloudflareWARP tunnel. Leave the fields below blank to keep auto-detection, or set them manually if auto-detection ever picks the wrong interface.</p>
-      <form method="POST" action="{url_for('bypass_uplink')}">
-        <div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:10px;">
-          <div class="input-group" style="margin-bottom:0;">
-            <label>Manual Interface (optional)</label>
-            <input type="text" name="iface" placeholder="e.g. eth0" value="{settings.get('iface') or ''}">
-          </div>
-          <div class="input-group" style="margin-bottom:0;">
-            <label>Manual Gateway IP (optional)</label>
-            <input type="text" name="gateway" placeholder="e.g. 192.168.1.1" value="{settings.get('gateway') or ''}">
-          </div>
-        </div>
-        <button class="btn btn-outline" style="width:auto;padding:10px 16px;">{icon('check',14)} Save Uplink Override</button>
-      </form>
+      <h3>{icon('network')} CDN Provider Auto-Sync
+        <span style="font-size:11.5px;font-weight:400;color:var(--muted);margin-left:8px;">Sync every hour automatically</span>
+      </h3>
+      <p style="color:var(--muted);font-size:12.5px;margin-bottom:12px;">
+        Banking apps like <strong>bKash</strong> and <strong>Nagad</strong> use major cloud CDNs (Cloudflare, AWS CloudFront)
+        whose IP addresses rotate constantly. Enabling a CDN provider here automatically installs bypass routes for
+        <em>all</em> of that CDN's IP ranges every hour — so your banking apps always work, even as CDN IPs change.
+      </p>
+      <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <thead>
+          <tr style="text-align:left;color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;">
+            <th style="padding-bottom:8px;">Provider</th>
+            <th style="padding-bottom:8px;">Coverage</th>
+            <th style="padding-bottom:8px;">State</th>
+            <th style="padding-bottom:8px;">Sync Status</th>
+            <th style="padding-bottom:8px;text-align:right;">Actions</th>
+          </tr>
+        </thead>
+        <tbody>{cdn_rows}</tbody>
+      </table>
     </div>
 
+    <!-- Add Bypass Rule Card -->
     <div class="card" style="margin-bottom:16px;">
       <h3>{icon('shield')} Add Bypass Rule</h3>
-      <p style="color:var(--muted);font-size:12.5px;margin-bottom:12px;">
-        Paste a domain (<code>bkash.com</code>), a full API URL (<code>https://api.nagad.com.bd/remote-payment-gateway-1.0</code>), a bare IP, or a CIDR block — the hostname/IP is extracted automatically. Add several at once: one per line, or comma-separated.
+      {warp_banner}
+      <p style="color:var(--muted);font-size:12.5px;margin-bottom:10px;">
+        Add a <strong>domain</strong>, full URL, IP, CIDR, or <strong>wildcard</strong> (<code>*.bkash.com</code>).
+        Wildcards probe common subdomains automatically (api., pgw., app., secure., …) so CDN endpoint IPs are all captured.
+        One entry per line, or comma-separated.
       </p>
+      <p style="font-size:12.5px;color:var(--muted);margin-bottom:8px;">🇧🇩 Quick-add Bangladesh banking &amp; fintech:</p>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px;" id="presets">
+        {''.join(f'<button type="button" class="preset-btn" onclick="addPreset(this)" data-val="{v}">{v}</button>'
+          for v in ['*.bkash.com','*.nagad.com.bd','*.cellfin.com.bd','*.upay.com.bd',
+                    '*.dmoney.com.bd','*.dutchbanglabank.com','*.bracbank.com',
+                    '*.ibbl.com.bd','*.tapn.com.bd','*.shohoz.com'])}
+      </div>
       <form method="POST" action="{url_for('bypass_add')}">
         <div class="input-group">
-          <label>Domains / URLs / IPs / CIDRs</label>
-          <textarea name="entries" rows="4" placeholder="bkash.com&#10;https://apigw.nagad.com.bd/remote-payment-gateway-1.0&#10;103.4.145.0/24" style="width:100%;padding:11px 12px;background:var(--panel-2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:14px;font-family:inherit;resize:vertical;"></textarea>
+          <label>Domains / Wildcards / URLs / IPs / CIDRs</label>
+          <textarea id="bypass-entries" name="entries" rows="5"
+            placeholder="*.bkash.com&#10;*.nagad.com.bd&#10;https://apigw.nagad.com.bd/remote-payment-gateway-1.0&#10;103.4.145.0/24"
+            style="width:100%;padding:11px 12px;background:var(--panel-2);border:1px solid var(--border);
+                   border-radius:10px;color:var(--text);font-size:14px;font-family:inherit;resize:vertical;"></textarea>
         </div>
         <button class="btn btn-primary" style="width:auto;padding:11px 20px;">{icon('check',16)} Add &amp; Apply Bypass</button>
       </form>
+      <script>
+      function addPreset(btn) {{
+        var ta = document.getElementById('bypass-entries');
+        var val = btn.getAttribute('data-val');
+        var cur = ta.value.trim();
+        ta.value = cur ? cur + '\n' + val : val;
+        btn.style.opacity = '0.45';
+        btn.disabled = true;
+      }}
+      </script>
     </div>
 
-    <div class="card">
+    <!-- Active Bypass Rules Card -->
+    <div class="card" style="margin-bottom:16px;">
       <h3>{icon('network')} Active Bypass Rules <span class="badge mode">{len(rules)}</span></h3>
       <div class="btn-row" style="margin-bottom:14px;">
         <form method="POST" action="{url_for('bypass_refresh_all')}">
@@ -1154,8 +1527,29 @@ def bypass():
         <tbody>{rows}</tbody>
       </table>
     </div>
+
+    <!-- Uplink Settings Card -->
+    <div class="card">
+      <h3>{icon('network')} Uplink Interface Override
+        <span style="font-size:11.5px;font-weight:400;color:var(--muted);margin-left:8px;">Auto-detected: {auto_iface or 'not found'} via {auto_gateway or 'N/A'}</span>
+      </h3>
+      <p style="color:var(--muted);font-size:12.5px;margin:10px 0;">Bypassed traffic exits via this interface instead of CloudflareWARP. Leave blank for auto-detection.</p>
+      <form method="POST" action="{url_for('bypass_uplink')}">
+        <div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:10px;">
+          <div class="input-group" style="margin-bottom:0;">
+            <label>Manual Interface (optional)</label>
+            <input type="text" name="iface" placeholder="e.g. eth0" value="{settings.get('iface') or ''}">
+          </div>
+          <div class="input-group" style="margin-bottom:0;">
+            <label>Manual Gateway IP (optional)</label>
+            <input type="text" name="gateway" placeholder="e.g. 192.168.1.1" value="{settings.get('gateway') or ''}">
+          </div>
+        </div>
+        <button class="btn btn-outline" style="width:auto;padding:10px 16px;">{icon('check',14)} Save Uplink Override</button>
+      </form>
+    </div>
     """
-    return render_page("bypass", "Bypass Rules", "Split-tunnel specific domains/IPs around the WARP tunnel", content)
+    return render_page("bypass", "Bypass Rules", "Smart split-tunnel for banking apps — WARP on, banks unblocked", content)
 
 
 @app.route("/bypass/add", methods=["POST"])
@@ -1258,6 +1652,38 @@ def bypass_uplink():
     save_bypass_settings({"iface": iface or None, "gateway": gateway or None})
     flash("Uplink override saved — re-applying existing rules...", "success")
     apply_all_bypass_rules()
+    return redirect(url_for("bypass"))
+
+
+# ---------------------------------------------------------------------------
+# CDN Provider management routes
+# ---------------------------------------------------------------------------
+@app.route("/bypass/cdn/toggle/<key>", methods=["POST"])
+@login_required
+def cdn_toggle(key):
+    if key not in _CDN_PROVIDERS:
+        flash("Unknown CDN provider.", "error")
+        return redirect(url_for("bypass"))
+    settings = load_cdn_settings()
+    prov = settings["providers"].setdefault(key, {})
+    prov["enabled"] = not prov.get("enabled", False)
+    save_cdn_settings(settings)
+    if prov["enabled"]:
+        threading.Thread(target=_cdn_sync_one, args=(key,), daemon=True).start()
+        flash(f"{_CDN_PROVIDERS[key]['name']} enabled — syncing IP ranges in the background.", "success")
+    else:
+        flash(f"{_CDN_PROVIDERS[key]['name']} disabled.", "success")
+    return redirect(url_for("bypass"))
+
+
+@app.route("/bypass/cdn/sync/<key>", methods=["POST"])
+@login_required
+def cdn_sync_now(key):
+    if key not in _CDN_PROVIDERS:
+        flash("Unknown CDN provider.", "error")
+        return redirect(url_for("bypass"))
+    threading.Thread(target=_cdn_sync_one, args=(key,), daemon=True).start()
+    flash(f"{_CDN_PROVIDERS[key]['name']} sync started in background — refresh in a few seconds.", "success")
     return redirect(url_for("bypass"))
 
 
@@ -1488,16 +1914,20 @@ def guide():
 
 
 if __name__ == "__main__":
-    # Bypass routes (see the "Bypass Rules" section above) live in the
-    # kernel routing table, not in a config file the kernel reads on its
-    # own — so on every service start/restart we need to re-install them
-    # from bypass_rules.json, then keep a background thread re-resolving
-    # domain-based rules so routes track IP changes over time.
+    # Re-install bypass routes from bypass_rules.json and re-sync WARP
+    # split-tunnel entries on every service start/restart so the gateway
+    # is fully configured before serving the first request.
     try:
         apply_all_bypass_rules()
     except Exception:
         pass
+
+    # Background thread 1: re-resolves domain/wildcard rules every 3 min
+    # so ip routes + warp-cli exclusions stay accurate as CDN IPs rotate.
     threading.Thread(target=bypass_refresh_loop, daemon=True).start()
+
+    # Background thread 2: syncs enabled CDN provider IP ranges every hour.
+    threading.Thread(target=cdn_sync_loop, daemon=True).start()
 
     # threaded=True: toggle_warp() can block for up to a few seconds while it
     # waits for the WARP daemon to settle. Without threading, that would
