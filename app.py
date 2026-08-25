@@ -22,6 +22,7 @@ CRED_FILE            = "/opt/warpgateway/credentials.json"
 BYPASS_RULES_FILE    = "/opt/warpgateway/bypass_rules.json"
 BYPASS_SETTINGS_FILE = "/opt/warpgateway/bypass_settings.json"
 CDN_SETTINGS_FILE    = "/opt/warpgateway/cdn_settings.json"
+COUNTRY_SETTINGS_FILE = "/opt/warpgateway/country_settings.json"
 SERVICE_NAME         = "warpgateway"
 
 
@@ -505,22 +506,130 @@ def bypass_refresh_loop(interval=180):
 # Cloudflare:     ~15 IPv4 ranges  (bKash, many fintech APIs)
 # AWS CloudFront: ~300 IPv4 ranges (Nagad, mobile banking backends)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Dynamic Country IP-Range Auto-Sync (National Direct Routing)
+#
+# Allows users from ANY country in the world to automatically fetch all official
+# delegated IPv4 CIDRs assigned to their nation via the global RIPE stat API.
+# When enabled for a country (e.g. BD, IN, PK, US, GB, AE, SA, MY, SG, etc.),
+# all local domestic traffic (banks, government portals, local ISP caches/BDIX)
+# routes directly via the physical ISP without touching the WARP tunnel.
+# ---------------------------------------------------------------------------
+ALL_COUNTRIES = [
+    ("AF", "Afghanistan"), ("AL", "Albania"), ("DZ", "Algeria"), ("AD", "Andorra"), ("AO", "Angola"),
+    ("AG", "Antigua and Barbuda"), ("AR", "Argentina"), ("AM", "Armenia"), ("AU", "Australia"), ("AT", "Austria"),
+    ("AZ", "Azerbaijan"), ("BS", "Bahamas"), ("BH", "Bahrain"), ("BD", "Bangladesh"), ("BB", "Barbados"),
+    ("BY", "Belarus"), ("BE", "Belgium"), ("BZ", "Belize"), ("BJ", "Benin"), ("BT", "Bhutan"),
+    ("BO", "Bolivia"), ("BA", "Bosnia and Herzegovina"), ("BW", "Botswana"), ("BR", "Brazil"), ("BN", "Brunei"),
+    ("BG", "Bulgaria"), ("BF", "Burkina Faso"), ("BI", "Burundi"), ("KH", "Cambodia"), ("CM", "Cameroon"),
+    ("CA", "Canada"), ("CV", "Cape Verde"), ("CF", "Central African Republic"), ("TD", "Chad"), ("CL", "Chile"),
+    ("CN", "China"), ("CO", "Colombia"), ("KM", "Comoros"), ("CG", "Congo"), ("CD", "Congo (DRC)"),
+    ("CR", "Costa Rica"), ("HR", "Croatia"), ("CU", "Cuba"), ("CY", "Cyprus"), ("CZ", "Czech Republic"),
+    ("DK", "Denmark"), ("DJ", "Djibouti"), ("DM", "Dominica"), ("DO", "Dominican Republic"), ("EC", "Ecuador"),
+    ("EG", "Egypt"), ("SV", "El Salvador"), ("GQ", "Equatorial Guinea"), ("ER", "Eritrea"), ("EE", "Estonia"),
+    ("SZ", "Eswatini"), ("ET", "Ethiopia"), ("FJ", "Fiji"), ("FI", "Finland"), ("FR", "France"),
+    ("GA", "Gabon"), ("GM", "Gambia"), ("GE", "Georgia"), ("DE", "Germany"), ("GH", "Ghana"),
+    ("GR", "Greece"), ("GD", "Grenada"), ("GT", "Guatemala"), ("GN", "Guinea"), ("GW", "Guinea-Bissau"),
+    ("GY", "Guyana"), ("HT", "Haiti"), ("HN", "Honduras"), ("HK", "Hong Kong"), ("HU", "Hungary"),
+    ("IS", "Iceland"), ("IN", "India"), ("ID", "Indonesia"), ("IR", "Iran"), ("IQ", "Iraq"),
+    ("IE", "Ireland"), ("IL", "Israel"), ("IT", "Italy"), ("JM", "Jamaica"), ("JP", "Japan"),
+    ("JO", "Jordan"), ("KZ", "Kazakhstan"), ("KE", "Kenya"), ("KW", "Kuwait"), ("KG", "Kyrgyzstan"),
+    ("LA", "Laos"), ("LV", "Latvia"), ("LB", "Lebanon"), ("LS", "Lesotho"), ("LR", "Liberia"),
+    ("LY", "Libya"), ("LI", "Liechtenstein"), ("LT", "Lithuania"), ("LU", "Luxembourg"), ("MO", "Macau"),
+    ("MG", "Madagascar"), ("MW", "Malawi"), ("MY", "Malaysia"), ("MV", "Maldives"), ("ML", "Mali"),
+    ("MT", "Malta"), ("MR", "Mauritania"), ("MU", "Mauritius"), ("MX", "Mexico"), ("MD", "Moldova"),
+    ("MC", "Monaco"), ("MN", "Mongolia"), ("ME", "Montenegro"), ("MA", "Morocco"), ("MZ", "Mozambique"),
+    ("MM", "Myanmar"), ("NA", "Namibia"), ("NP", "Nepal"), ("NL", "Netherlands"), ("NZ", "New Zealand"),
+    ("NI", "Nicaragua"), ("NE", "Niger"), ("NG", "Nigeria"), ("MK", "North Macedonia"), ("NO", "Norway"),
+    ("OM", "Oman"), ("PK", "Pakistan"), ("PS", "Palestine"), ("PA", "Panama"), ("PG", "Papua New Guinea"),
+    ("PY", "Paraguay"), ("PE", "Peru"), ("PH", "Philippines"), ("PL", "Poland"), ("PT", "Portugal"),
+    ("QA", "Qatar"), ("RO", "Romania"), ("RU", "Russia"), ("RW", "Rwanda"), ("SA", "Saudi Arabia"),
+    ("SN", "Senegal"), ("RS", "Serbia"), ("SC", "Seychelles"), ("SL", "Sierra Leone"), ("SG", "Singapore"),
+    ("SK", "Slovakia"), ("SI", "Slovenia"), ("SO", "Somalia"), ("ZA", "South Africa"), ("KR", "South Korea"),
+    ("SS", "South Sudan"), ("ES", "Spain"), ("LK", "Sri Lanka"), ("SD", "Sudan"), ("SR", "Suriname"),
+    ("SE", "Sweden"), ("CH", "Switzerland"), ("SY", "Syria"), ("TW", "Taiwan"), ("TJ", "Tajikistan"),
+    ("TZ", "Tanzania"), ("TH", "Thailand"), ("TL", "Timor-Leste"), ("TG", "Togo"), ("TN", "Tunisia"),
+    ("TR", "Turkey"), ("TM", "Turkmenistan"), ("UG", "Uganda"), ("UA", "Ukraine"), ("AE", "United Arab Emirates"),
+    ("GB", "United Kingdom"), ("US", "United States"), ("UY", "Uruguay"), ("UZ", "Uzbekistan"), ("VE", "Venezuela"),
+    ("VN", "Vietnam"), ("YE", "Yemen"), ("ZM", "Zambia"), ("ZW", "Zimbabwe")
+]
+
+
+def load_country_settings():
+    defaults = {
+        "countries": {
+            "BD": {"name": "Bangladesh", "enabled": True, "last_sync": None, "cidr_count": 0, "error": None}
+        }
+    }
+    return _load_json(COUNTRY_SETTINGS_FILE, defaults)
+
+
+def save_country_settings(settings):
+    _save_json(COUNTRY_SETTINGS_FILE, settings)
+
+
+def fetch_country_cidrs(code):
+    """Fetch official delegated IPv4 CIDR list for any ISO-3166-1 alpha-2 country code."""
+    code = code.strip().upper()
+    try:
+        import urllib.request, json as _json
+        req = urllib.request.Request(
+            f"https://stat.ripe.net/data/country-resource-list/data.json?resource={code}",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = _json.loads(resp.read())
+        ipv4_list = data.get("data", {}).get("resources", {}).get("ipv4", [])
+        return [cidr for cidr in ipv4_list if "/" in cidr]
+    except Exception as exc:
+        return exc
+
+
+def sync_country(code):
+    """Fetch and apply routes for a specific country code."""
+    code = code.strip().upper()
+    result = fetch_country_cidrs(code)
+    if isinstance(result, Exception):
+        return 0, str(result)
+    if not result:
+        return 0, "No IPv4 allocations returned for this country code."
+    count = _apply_cdn_cidrs(result)
+    return count, None
+
+
+def _country_sync_one(code):
+    """Sync a single country in a background thread."""
+    try:
+        count, err = sync_country(code)
+        settings = load_country_settings()
+        item = settings.get("countries", {}).setdefault(code, {})
+        item["last_sync"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        item["cidr_count"] = count
+        item["error"] = err
+        save_country_settings(settings)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Global Cloud & CDN IP-Range Auto-Sync
+# ---------------------------------------------------------------------------
 _CDN_PROVIDERS = {
     "cloudflare": {
-        "name": "Cloudflare CDN",
-        "description": "Used by bKash and many fintech APIs (~15 IPv4 ranges)",
+        "name": "Cloudflare CDN (Global)",
+        "description": "Anycast edge IP ranges used by Cloudflare-protected banking/fintech APIs (~15 IPv4 ranges)",
     },
     "aws_cloudfront": {
-        "name": "AWS CloudFront",
-        "description": "Used by Nagad, mobile banking backends (~300 IPv4 ranges)",
+        "name": "AWS CloudFront (Global CDN)",
+        "description": "Global edge CDN distributions for AWS-hosted mobile apps (~300 IPv4 ranges)",
     },
     "aws_asia": {
-        "name": "AWS Asia (Singapore/Mumbai)",
-        "description": "Crucial for bKash backend EC2 servers & BD startups (~800 IPv4 ranges)",
+        "name": "AWS Asia-Pacific (Compute & APIs)",
+        "description": "AWS EC2 regions in Singapore & Mumbai (~800 IPv4 ranges)",
     },
-    "bd_national": {
-        "name": "Bangladesh National IPs",
-        "description": "Bypass ALL local BD traffic (BDIX, Banks, ISP caches). Recommended! (~2300 IPv4 ranges)",
+    "aws_europe": {
+        "name": "AWS Europe (Frankfurt / London / Ireland)",
+        "description": "AWS EC2 regions in European financial hubs (~1200 IPv4 ranges)",
     },
 }
 
@@ -528,10 +637,10 @@ _CDN_PROVIDERS = {
 def load_cdn_settings():
     defaults = {
         "providers": {
-            "cloudflare":     {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
-            "aws_cloudfront": {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
-            "aws_asia":       {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
-            "bd_national":    {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
+            "cloudflare":     {"enabled": True, "last_sync": None, "cidr_count": 0, "error": None},
+            "aws_cloudfront": {"enabled": True, "last_sync": None, "cidr_count": 0, "error": None},
+            "aws_asia":       {"enabled": True, "last_sync": None, "cidr_count": 0, "error": None},
+            "aws_europe":     {"enabled": False, "last_sync": None, "cidr_count": 0, "error": None},
         }
     }
     return _load_json(CDN_SETTINGS_FILE, defaults)
@@ -589,18 +698,19 @@ def _fetch_aws_asia_cidrs():
         return exc
 
 
-def _fetch_bd_national_cidrs():
-    """Fetch all IPv4 ranges assigned to Bangladesh from RIPE stat API."""
+def _fetch_aws_europe_cidrs():
+    """Fetch AWS ip-ranges.json and extract EC2 regions for Europe."""
     try:
         import urllib.request, json as _json
-        req = urllib.request.Request(
-            "https://stat.ripe.net/data/country-resource-list/data.json?resource=BD",
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(
+            "https://ip-ranges.amazonaws.com/ip-ranges.json", timeout=15
+        ) as resp:
             data = _json.loads(resp.read())
-        ipv4_list = data.get("data", {}).get("resources", {}).get("ipv4", [])
-        return [cidr for cidr in ipv4_list if "/" in cidr]
+        return [
+            p["ip_prefix"]
+            for p in data.get("prefixes", [])
+            if p.get("region") in ("eu-central-1", "eu-west-1", "eu-west-2", "eu-west-3")
+        ]
     except Exception as exc:
         return exc
 
@@ -640,7 +750,7 @@ def sync_cdn_provider(provider_key):
         "cloudflare":     _fetch_cloudflare_cidrs,
         "aws_cloudfront": _fetch_aws_cloudfront_cidrs,
         "aws_asia":       _fetch_aws_asia_cidrs,
-        "bd_national":    _fetch_bd_national_cidrs,
+        "aws_europe":     _fetch_aws_europe_cidrs,
     }
     fn = fetchers.get(provider_key)
     if fn is None:
@@ -655,8 +765,7 @@ def sync_cdn_provider(provider_key):
 
 
 def _cdn_sync_one(key):
-    """Sync a single CDN provider and persist results. Designed to run in a
-    daemon thread so it never blocks an HTTP request."""
+    """Sync a single CDN provider and persist results."""
     try:
         count, err = sync_cdn_provider(key)
         settings = load_cdn_settings()
@@ -670,10 +779,11 @@ def _cdn_sync_one(key):
 
 
 def cdn_sync_loop(interval=3600):
-    """Background thread: syncs enabled CDN providers every hour."""
+    """Background thread: syncs enabled CDN providers AND enabled countries every hour."""
     while True:
         time.sleep(interval)
         try:
+            # 1. Sync enabled CDN providers
             settings = load_cdn_settings()
             changed = False
             for key, prov in settings.get("providers", {}).items():
@@ -686,6 +796,20 @@ def cdn_sync_loop(interval=3600):
                 changed = True
             if changed:
                 save_cdn_settings(settings)
+
+            # 2. Sync enabled Country IP blocks
+            csettings = load_country_settings()
+            cchanged = False
+            for code, citem in csettings.get("countries", {}).items():
+                if not citem.get("enabled"):
+                    continue
+                count, err = sync_country(code)
+                citem["last_sync"]  = time.strftime("%Y-%m-%d %H:%M:%S")
+                citem["cidr_count"] = count
+                citem["error"]      = err
+                cchanged = True
+            if cchanged:
+                save_country_settings(csettings)
         except Exception:
             pass
 
@@ -1451,11 +1575,12 @@ def network():
 @app.route("/bypass")
 @login_required
 def bypass():
-    rules        = load_bypass_rules()
-    settings     = load_bypass_settings()
-    cdn_settings = load_cdn_settings()
+    rules            = load_bypass_rules()
+    settings         = load_bypass_settings()
+    cdn_settings     = load_cdn_settings()
+    country_settings = load_country_settings()
     auto_iface, auto_gateway = detect_uplink()
-    warp_cli_ok  = warp_st_supported()
+    warp_cli_ok      = warp_st_supported()
 
     # ── Type badge colours ────────────────────────────────────────────────
     TYPE_BADGE = {
@@ -1470,11 +1595,11 @@ def bypass():
         cls = "on" if st == "active" else ("off" if st == "error" else "mode")
         return f'<span class="badge {cls}">{st.upper()}</span>'
 
-    # ── Active bypass rules table rows ────────────────────────────────────
+    # ── Active custom bypass rules table rows ─────────────────────────────
     rows = ""
     if not rules:
         rows = ('<tr><td colspan="5" style="padding:14px 0;color:var(--muted);">'
-                'No bypass rules yet — add bank/fintech domains below.</td></tr>')
+                'No custom rules yet — add domains, IPs, or CIDRs below.</td></tr>')
     else:
         for r in rules:
             ips      = ", ".join(r.get("resolved_ips", [])) or "—"
@@ -1501,6 +1626,43 @@ def bypass():
               </td>
             </tr>
             """
+
+    # ── Country IP Auto-Sync Table Rows ───────────────────────────────────
+    country_rows = ""
+    for code, cdata in country_settings.get("countries", {}).items():
+        enabled     = cdata.get("enabled", False)
+        name        = cdata.get("name", code)
+        last_sync   = cdata.get("last_sync") or "Never"
+        cidr_count  = cdata.get("cidr_count", 0)
+        c_err       = cdata.get("error")
+        status_txt  = f"{cidr_count} CIDRs applied" if not c_err else f"Error: {c_err[:50]}"
+        badge_cls   = "on" if (enabled and not c_err) else ("off" if c_err else "mode")
+        country_rows += f"""
+        <tr>
+          <td style="padding:10px 0;font-weight:600;">{name} <span class="badge mode" style="font-size:10.5px;">{code}</span></td>
+          <td style="padding:10px 0;color:var(--muted);font-size:12.5px;">Official delegated RIR IPv4 allocations for {name}</td>
+          <td style="padding:10px 0;"><span class="badge {badge_cls}">{'ENABLED' if enabled else 'DISABLED'}</span></td>
+          <td style="padding:10px 0;color:var(--muted);font-size:12px;">{status_txt}<br>
+              <span style="font-size:11px;">Last sync: {last_sync}</span></td>
+          <td style="padding:10px 0;text-align:right;white-space:nowrap;">
+            <form method="POST" action="{url_for('country_toggle', code=code)}" style="display:inline;">
+              <button class="btn {'btn-danger' if enabled else 'btn-primary'} btn-sm">{'Disable' if enabled else 'Enable'}</button>
+            </form>
+            <form method="POST" action="{url_for('country_sync_now', code=code)}" style="display:inline;">
+              <button class="btn btn-outline btn-sm">{icon('activity',14)} Sync Now</button>
+            </form>
+            <form method="POST" action="{url_for('country_delete', code=code)}" style="display:inline;"
+                  onsubmit="return confirm('Remove {name} from country auto-bypass?');">
+              <button class="btn btn-outline btn-sm" style="color:var(--red);">Delete</button>
+            </form>
+          </td>
+        </tr>
+        """
+    if not country_rows:
+        country_rows = '<tr><td colspan="5" style="padding:12px 0;color:var(--muted);">No countries configured. Select or enter a country code below.</td></tr>'
+
+    # Build country dropdown options with all 240+ countries
+    country_options = "".join(f'<option value="{c[0]}">{c[1]} ({c[0]})</option>' for c in ALL_COUNTRIES)
 
     # ── CDN providers table rows ──────────────────────────────────────────
     cdn_rows = ""
@@ -1544,27 +1706,60 @@ def bypass():
     )
 
     content = f"""
-    <style>
-      .preset-btn{{display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border-radius:8px;
-        background:rgba(79,142,247,.1);border:1px solid rgba(79,142,247,.3);color:#a5c8ff;
-        font-size:12px;font-weight:600;cursor:pointer;transition:.15s;}}
-      .preset-btn:hover{{background:rgba(79,142,247,.2);}}
-    </style>
-
-    <!-- CDN Auto-Sync Card -->
+    <!-- Country IP Range Auto-Bypass Card -->
     <div class="card" style="margin-bottom:16px;">
-      <h3>{icon('network')} CDN Provider Auto-Sync
-        <span style="font-size:11.5px;font-weight:400;color:var(--muted);margin-left:8px;">Sync every hour automatically</span>
+      <h3>{icon('network')} National IP Auto-Bypass (By Country / Region)
+        <span style="font-size:11.5px;font-weight:400;color:var(--muted);margin-left:8px;">Direct routing for domestic banking, government &amp; local ISP traffic</span>
+      </h3>
+      <p style="color:var(--muted);font-size:12.5px;margin-bottom:14px;">
+        Select your home country or enter any 2-letter ISO Country Code. The gateway automatically pulls official real-time
+        IP allocations via the global RIR/RIPE database and routes all national traffic directly through your ISP — preventing
+        location blocks on domestic banking apps while keeping international traffic encrypted via WARP.
+      </p>
+      <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:16px;">
+        <thead>
+          <tr style="text-align:left;color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;">
+            <th style="padding-bottom:8px;">Country</th>
+            <th style="padding-bottom:8px;">Description</th>
+            <th style="padding-bottom:8px;">State</th>
+            <th style="padding-bottom:8px;">Sync Status</th>
+            <th style="padding-bottom:8px;text-align:right;">Actions</th>
+          </tr>
+        </thead>
+        <tbody>{country_rows}</tbody>
+      </table>
+
+      <!-- Add New Country Form -->
+      <form method="POST" action="{url_for('country_add')}" style="background:var(--panel-2);padding:14px 16px;border-radius:12px;border:1px solid var(--border);">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#dbe4f3;">+ Add Country IP Allocation</div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+          <div style="flex:1;min-width:200px;">
+            <select name="selected_country" style="width:100%;padding:9px 12px;background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;">
+              <option value="">-- Choose from Popular Countries --</option>
+              {country_options}
+            </select>
+          </div>
+          <div style="width:140px;">
+            <input type="text" name="custom_code" placeholder="or ISO (e.g. TH)" maxlength="2" style="width:100%;padding:9px 12px;background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;text-transform:uppercase;">
+          </div>
+          <button class="btn btn-primary btn-sm" style="width:auto;padding:9px 18px;">{icon('check',14)} Add &amp; Sync Country</button>
+        </div>
+      </form>
+    </div>
+
+    <!-- Global Cloud & CDN Auto-Sync Card -->
+    <div class="card" style="margin-bottom:16px;">
+      <h3>{icon('network')} Global Cloud &amp; CDN Provider Auto-Sync
+        <span style="font-size:11.5px;font-weight:400;color:var(--muted);margin-left:8px;">Syncs every hour automatically</span>
       </h3>
       <p style="color:var(--muted);font-size:12.5px;margin-bottom:12px;">
-        Banking apps like <strong>bKash</strong> and <strong>Nagad</strong> use major cloud CDNs (Cloudflare, AWS CloudFront)
-        whose IP addresses rotate constantly. Enabling a CDN provider here automatically installs bypass routes for
-        <em>all</em> of that CDN's IP ranges every hour — so your banking apps always work, even as CDN IPs change.
+        Major fintech apps host their APIs across global CDN edges and regional cloud compute clusters. Enabling cloud providers here
+        automatically maintains bypass routes for all authoritative IPv4 CIDR blocks.
       </p>
       <table style="width:100%;border-collapse:collapse;font-size:13px;">
         <thead>
           <tr style="text-align:left;color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;">
-            <th style="padding-bottom:8px;">Provider</th>
+            <th style="padding-bottom:8px;">Provider / Region</th>
             <th style="padding-bottom:8px;">Coverage</th>
             <th style="padding-bottom:8px;">State</th>
             <th style="padding-bottom:8px;">Sync Status</th>
@@ -1575,48 +1770,29 @@ def bypass():
       </table>
     </div>
 
-    <!-- Add Bypass Rule Card -->
+    <!-- Add Custom Bypass Rule Card -->
     <div class="card" style="margin-bottom:16px;">
-      <h3>{icon('shield')} Add Bypass Rule</h3>
+      <h3>{icon('shield')} Add Custom Bypass Rule</h3>
       {warp_banner}
       <p style="color:var(--muted);font-size:12.5px;margin-bottom:10px;">
-        Add a <strong>domain</strong>, full URL, IP, CIDR, or <strong>wildcard</strong> (<code>*.bkash.com</code>).
-        Wildcards probe common subdomains automatically (api., pgw., app., secure., …) so CDN endpoint IPs are all captured.
-        One entry per line, or comma-separated.
+        Add a <strong>domain</strong>, full URL, IP, CIDR, or <strong>wildcard</strong> (e.g. <code>*.example.com</code>).
+        Wildcards automatically probe common fintech and API subdomains. One entry per line, or comma-separated.
       </p>
-      <p style="font-size:12.5px;color:var(--muted);margin-bottom:8px;">🇧🇩 Quick-add Bangladesh banking &amp; fintech:</p>
-      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px;" id="presets">
-        {''.join(f'<button type="button" class="preset-btn" onclick="addPreset(this)" data-val="{v}">{v}</button>'
-          for v in ['*.bkash.com','*.bka.sh','*.nagad.com.bd','*.cellfin.com.bd','*.upay.com.bd',
-                    '*.dmoney.com.bd','*.dutchbanglabank.com','*.bracbank.com',
-                    '*.ibbl.com.bd','*.tapn.com.bd','*.shohoz.com','*.sslcommerz.com',
-                    '*.ipinfo.io','*.ip-api.com','*.api.ipify.org'])}
-      </div>
       <form method="POST" action="{url_for('bypass_add')}">
         <div class="input-group">
           <label>Domains / Wildcards / URLs / IPs / CIDRs</label>
-          <textarea id="bypass-entries" name="entries" rows="5"
-            placeholder="*.bkash.com&#10;*.nagad.com.bd&#10;https://apigw.nagad.com.bd/remote-payment-gateway-1.0&#10;103.4.145.0/24"
+          <textarea id="bypass-entries" name="entries" rows="4"
+            placeholder="*.examplebank.com&#10;api.paymentgateway.com&#10;103.4.145.0/24"
             style="width:100%;padding:11px 12px;background:var(--panel-2);border:1px solid var(--border);
                    border-radius:10px;color:var(--text);font-size:14px;font-family:inherit;resize:vertical;"></textarea>
         </div>
         <button class="btn btn-primary" style="width:auto;padding:11px 20px;">{icon('check',16)} Add &amp; Apply Bypass</button>
       </form>
-      <script>
-      function addPreset(btn) {{
-        var ta = document.getElementById('bypass-entries');
-        var val = btn.getAttribute('data-val');
-        var cur = ta.value.trim();
-        ta.value = cur ? cur + '\\n' + val : val;
-        btn.style.opacity = '0.45';
-        btn.disabled = true;
-      }}
-      </script>
     </div>
 
     <!-- Active Bypass Rules Card -->
     <div class="card" style="margin-bottom:16px;">
-      <h3>{icon('network')} Active Bypass Rules <span class="badge mode">{len(rules)}</span></h3>
+      <h3>{icon('network')} Custom Bypass Rules <span class="badge mode">{len(rules)}</span></h3>
       <div class="btn-row" style="margin-bottom:14px;">
         <form method="POST" action="{url_for('bypass_refresh_all')}">
           <button class="btn btn-outline btn-sm">{icon('activity',14)} Re-apply / Re-resolve All</button>
@@ -1657,7 +1833,7 @@ def bypass():
       </form>
     </div>
     """
-    return render_page("bypass", "Bypass Rules", "Smart split-tunnel for banking apps — WARP on, banks unblocked", content)
+    return render_page("bypass", "Bypass Rules", "Smart split-tunnel for banking apps & local traffic — WARP on, domestic apps unblocked", content)
 
 
 @app.route("/bypass/add", methods=["POST"])
@@ -1792,6 +1968,79 @@ def cdn_sync_now(key):
         return redirect(url_for("bypass"))
     threading.Thread(target=_cdn_sync_one, args=(key,), daemon=True).start()
     flash(f"{_CDN_PROVIDERS[key]['name']} sync started in background — refresh in a few seconds.", "success")
+    return redirect(url_for("bypass"))
+
+
+# ---------------------------------------------------------------------------
+# Country IP Range management routes
+# ---------------------------------------------------------------------------
+@app.route("/bypass/country/add", methods=["POST"])
+@login_required
+def country_add():
+    sel = request.form.get("selected_country", "").strip().upper()
+    custom = request.form.get("custom_code", "").strip().upper()
+    code = custom if custom else sel
+    if not code or len(code) != 2:
+        flash("Please select a country or enter a valid 2-letter ISO country code (e.g. BD, IN, PK, US, etc.).", "error")
+        return redirect(url_for("bypass"))
+
+    # Lookup country name from all world countries
+    name_map = dict(ALL_COUNTRIES)
+    cname = name_map.get(code, f"Country ({code})")
+
+    settings = load_country_settings()
+    citem = settings.get("countries", {}).setdefault(code, {})
+    citem["name"] = cname
+    citem["enabled"] = True
+    save_country_settings(settings)
+
+    threading.Thread(target=_country_sync_one, args=(code,), daemon=True).start()
+    flash(f"{cname} ({code}) added — syncing IP allocations via RIPE stat in background.", "success")
+    return redirect(url_for("bypass"))
+
+
+@app.route("/bypass/country/toggle/<code>", methods=["POST"])
+@login_required
+def country_toggle(code):
+    code = code.strip().upper()
+    settings = load_country_settings()
+    if code not in settings.get("countries", {}):
+        flash("Country not found.", "error")
+        return redirect(url_for("bypass"))
+    citem = settings["countries"][code]
+    citem["enabled"] = not citem.get("enabled", False)
+    save_country_settings(settings)
+    if citem["enabled"]:
+        threading.Thread(target=_country_sync_one, args=(code,), daemon=True).start()
+        flash(f"{citem.get('name', code)} auto-bypass enabled — syncing in background.", "success")
+    else:
+        flash(f"{citem.get('name', code)} auto-bypass disabled.", "success")
+    return redirect(url_for("bypass"))
+
+
+@app.route("/bypass/country/sync/<code>", methods=["POST"])
+@login_required
+def country_sync_now(code):
+    code = code.strip().upper()
+    settings = load_country_settings()
+    if code not in settings.get("countries", {}):
+        flash("Country not found.", "error")
+        return redirect(url_for("bypass"))
+    citem = settings["countries"][code]
+    threading.Thread(target=_country_sync_one, args=(code,), daemon=True).start()
+    flash(f"Syncing IP allocations for {citem.get('name', code)} in background...", "success")
+    return redirect(url_for("bypass"))
+
+
+@app.route("/bypass/country/delete/<code>", methods=["POST"])
+@login_required
+def country_delete(code):
+    code = code.strip().upper()
+    settings = load_country_settings()
+    if code in settings.get("countries", {}):
+        del settings["countries"][code]
+        save_country_settings(settings)
+        flash(f"Removed country {code} from auto-bypass list.", "success")
     return redirect(url_for("bypass"))
 
 
