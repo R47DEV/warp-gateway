@@ -40,7 +40,7 @@ log_info "Updating system packages and installing required dependencies..."
 export DEBIAN_FRONTEND=noninteractive
 apt update -y || { log_warn "Apt update failed, attempting automatic fix..."; apt update --fix-missing -y; }
 
-apt install -y curl gnupg lsb-release iptables python3 python3-pip iptables-persistent net-tools bsdextrautils bsdmainutils speedtest-cli conntrack || {
+apt install -y curl gnupg lsb-release iptables iproute2 dnsutils python3 python3-pip iptables-persistent net-tools bsdextrautils bsdmainutils speedtest-cli conntrack || {
     log_error "Failed to install required dependencies."
     exit 1
 }
