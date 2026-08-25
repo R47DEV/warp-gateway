@@ -366,7 +366,7 @@ BASE = """
   .footer-credit a{display:inline-flex;align-items:center;gap:6px;color:var(--muted);}
   .footer-credit a:hover{color:var(--accent1);}
 
-  .main{flex:1;padding:28px 36px;max-width:1100px;}
+  .main{flex:1;padding:28px 36px;}
   .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;flex-wrap:wrap;gap:12px;}
   .page-title{font-size:22px;font-weight:700;}
   .page-sub{color:var(--muted);font-size:13px;margin-top:2px;}
