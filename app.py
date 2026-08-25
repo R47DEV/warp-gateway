@@ -101,6 +101,100 @@ def delayed_restart():
 
 
 # ---------------------------------------------------------------------------
+# WARP mode
+# ---------------------------------------------------------------------------
+def get_warp_mode():
+    """Parse the active mode ('Warp', 'DNS over HTTPS', 'Proxy', ...) out of
+    `warp-cli settings`. Falls back to 'Unknown' if the CLI output format
+    ever changes."""
+    settings_out = run_cmd("warp-cli --accept-tos settings")
+    match = re.search(r"Mode:\s*(.+)", settings_out)
+    return match.group(1).strip() if match else "Unknown"
+
+
+# ---------------------------------------------------------------------------
+# Network throughput / data usage
+# ---------------------------------------------------------------------------
+def get_default_iface():
+    """Interface used for the default route, e.g. 'eth0' or 'CloudflareWARP'."""
+    out = run_cmd("ip route show default")
+    match = re.search(r"dev\s+(\S+)", out)
+    return match.group(1) if match else None
+
+
+def get_iface_bytes(iface):
+    """Total RX/TX bytes for `iface` since boot, read from /proc/net/dev."""
+    if not iface:
+        return 0, 0
+    try:
+        with open("/proc/net/dev") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                name, data = line.split(":", 1)
+                if name.strip() != iface:
+                    continue
+                fields = data.split()
+                rx_bytes = int(fields[0])
+                tx_bytes = int(fields[8])
+                return rx_bytes, tx_bytes
+    except Exception:
+        pass
+    return 0, 0
+
+
+def humanize_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def get_throughput(iface, sample_seconds=1.0):
+    """Instantaneous download/upload rate in bytes/sec, measured by sampling
+    /proc/net/dev twice with a short delay in between."""
+    if not iface:
+        return 0, 0
+    rx1, tx1 = get_iface_bytes(iface)
+    time.sleep(sample_seconds)
+    rx2, tx2 = get_iface_bytes(iface)
+    rx_rate = max(0, (rx2 - rx1) / sample_seconds)
+    tx_rate = max(0, (tx2 - tx1) / sample_seconds)
+    return rx_rate, tx_rate
+
+
+# ---------------------------------------------------------------------------
+# On-demand speed test (runs in a background thread; result cached)
+# ---------------------------------------------------------------------------
+speedtest_state = {"running": False, "result": None, "error": None, "ran_at": None}
+
+
+def run_speedtest_bg():
+    speedtest_state["running"] = True
+    speedtest_state["error"] = None
+    try:
+        out = run_cmd("speedtest-cli --simple", timeout=90)
+        download = upload = ping = None
+        for line in out.splitlines():
+            if line.startswith("Ping:"):
+                ping = line.split(":", 1)[1].strip()
+            elif line.startswith("Download:"):
+                download = line.split(":", 1)[1].strip()
+            elif line.startswith("Upload:"):
+                upload = line.split(":", 1)[1].strip()
+        if download and upload:
+            speedtest_state["result"] = {"ping": ping, "download": download, "upload": upload}
+        else:
+            speedtest_state["error"] = out or "speedtest-cli produced no output."
+    except Exception as e:
+        speedtest_state["error"] = str(e)
+    finally:
+        speedtest_state["running"] = False
+        speedtest_state["ran_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
 # Icons (inline SVG, feather-style, no external dependency)
 # ---------------------------------------------------------------------------
 ICONS = {
@@ -118,6 +212,8 @@ ICONS = {
     "server": '<rect x="2" y="3" width="20" height="7" rx="1"/><rect x="2" y="14" width="20" height="7" rx="1"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/>',
     "check": '<polyline points="20 6 9 17 4 12"/>',
     "github": '<path d="M9 19c-4.3 1.4-4.3-2.5-6-3m12 5v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1.1-.3-3.5 1.3a12.3 12.3 0 0 0-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/>',
+    "activity": '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
+    "gauge": '<path d="M12 14 15 9"/><circle cx="12" cy="12" r="10"/><path d="M8 12a4 4 0 0 1 8 0"/>',
 }
 
 
@@ -221,6 +317,7 @@ BASE = """
   .badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11.5px;font-weight:600;}
   .badge.on{background:rgba(34,197,94,0.15);color:#86efac;}
   .badge.off{background:rgba(239,68,68,0.15);color:#fca5a5;}
+  .badge.mode{background:rgba(79,142,247,0.15);color:#a5c8ff;}
 
   .guide-step{display:flex;gap:16px;padding:20px 0;border-bottom:1px solid var(--border);}
   .guide-step:last-child{border-bottom:none;}
@@ -235,6 +332,12 @@ BASE = """
   .login-logo{width:52px;height:52px;border-radius:14px;background:linear-gradient(135deg,var(--accent1),var(--accent2));display:flex;align-items:center;justify-content:center;margin:0 auto 18px auto;}
   .login-card h1{font-size:21px;font-weight:700;text-align:center;margin-bottom:6px;}
   .login-card p.subtitle{text-align:center;color:var(--muted);font-size:13px;margin-bottom:26px;}
+
+  .stat-big{font-size:26px;font-weight:700;line-height:1.2;}
+  .stat-sub{font-size:11.5px;color:var(--muted);margin-top:2px;}
+  .speed-row{display:flex;gap:16px;}
+  .speed-col{flex:1;background:var(--panel-2);border:1px solid var(--border);border-radius:12px;padding:14px 16px;}
+  .speed-col .dirlabel{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-bottom:6px;}
 
   @media (max-width:820px){
     .shell{flex-direction:column;}
@@ -382,12 +485,34 @@ def dashboard():
     status_out = get_warp_status()
     pub_ip = get_public_ip()
     gw_ip = get_gateway_ip()
+    mode = get_warp_mode()
+
+    iface = get_default_iface()
+    rx_rate, tx_rate = get_throughput(iface, sample_seconds=1.0)
+    rx_total, tx_total = get_iface_bytes(iface)
+
+    st = speedtest_state
+    if st["running"]:
+        speed_block = f"""<p style="color:var(--muted);font-size:13px;">{icon('gauge',14)} Test running… refresh in a bit.</p>"""
+    elif st["result"]:
+        r = st["result"]
+        speed_block = f"""
+        <div class="info-row"><span class="label">Download</span><span class="value">{r['download']}</span></div>
+        <div class="info-row"><span class="label">Upload</span><span class="value">{r['upload']}</span></div>
+        <div class="info-row"><span class="label">Ping</span><span class="value">{r['ping']}</span></div>
+        <div class="info-row"><span class="label">Last run</span><span class="value">{st['ran_at']}</span></div>
+        """
+    elif st["error"]:
+        speed_block = f"""<p style="color:var(--muted);font-size:13px;">Last attempt failed: {st['error']}</p>"""
+    else:
+        speed_block = """<p style="color:var(--muted);font-size:13px;">No speed test run yet.</p>"""
 
     content = f"""
     <div class="grid">
       <div class="card">
         <h3>{icon('power')} WARP Connection</h3>
         <div class="info-row"><span class="label">Status</span><span class="badge {'on' if connected else 'off'}">{'CONNECTED' if connected else 'DISCONNECTED'}</span></div>
+        <div class="info-row"><span class="label">Mode</span><span class="badge mode">{mode.upper()}</span></div>
         <div class="info-row"><span class="label">Public WAN IP</span><span class="value">{pub_ip}</span></div>
         <div class="info-row"><span class="label">Gateway LAN IP</span><span class="value">{gw_ip}</span></div>
         <div style="margin-top:16px;" class="btn-row">
@@ -395,6 +520,31 @@ def dashboard():
             <button class="btn {'btn-danger' if connected else 'btn-primary'}">{icon('power',16)} {'Disconnect WARP' if connected else 'Connect WARP'}</button>
           </form>
         </div>
+      </div>
+
+      <div class="card">
+        <h3>{icon('activity')} Live Throughput ({iface or 'no default route'})</h3>
+        <div class="speed-row">
+          <div class="speed-col">
+            <div class="dirlabel">↓ Download</div>
+            <div class="stat-big">{humanize_bytes(rx_rate)}/s</div>
+          </div>
+          <div class="speed-col">
+            <div class="dirlabel">↑ Upload</div>
+            <div class="stat-big">{humanize_bytes(tx_rate)}/s</div>
+          </div>
+        </div>
+        <div class="stat-sub" style="margin-top:12px;">Total since boot — RX {humanize_bytes(rx_total)}, TX {humanize_bytes(tx_total)}</div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3>{icon('gauge')} Internet Speed Test</h3>
+        {speed_block}
+        <form method="POST" action="{url_for('run_speedtest')}" style="margin-top:14px;">
+          <button class="btn btn-outline" {'disabled' if st['running'] else ''}>{icon('gauge',16)} Run Speed Test</button>
+        </form>
       </div>
 
       <div class="card">
@@ -426,6 +576,17 @@ def toggle_warp(action):
     return redirect(url_for("dashboard"))
 
 
+@app.route("/speedtest/run", methods=["POST"])
+@login_required
+def run_speedtest():
+    if speedtest_state["running"]:
+        flash("A speed test is already running — check back in a moment.", "success")
+    else:
+        threading.Thread(target=run_speedtest_bg, daemon=True).start()
+        flash("Speed test started. Refresh in ~20-30 seconds for results.", "success")
+    return redirect(url_for("dashboard"))
+
+
 @app.route("/warp/mode", methods=["POST"])
 @login_required
 def warp_mode():
@@ -449,6 +610,10 @@ def network():
     account_out = run_cmd("warp-cli --accept-tos account")
     settings_out = run_cmd("warp-cli --accept-tos settings")
     clients_out = run_cmd("arp -a") or "No connected clients found."
+    mode = get_warp_mode().lower()
+
+    def sel(key):
+        return "selected" if key in mode else ""
 
     content = f"""
     <div class="grid">
@@ -462,13 +627,14 @@ def network():
 
       <div class="card">
         <h3>{icon('network')} Switch WARP Mode</h3>
-        <form method="POST" action="{url_for('warp_mode')}">
+        <div class="info-row"><span class="label">Current Mode</span><span class="badge mode">{mode.upper() or 'UNKNOWN'}</span></div>
+        <form method="POST" action="{url_for('warp_mode')}" style="margin-top:10px;">
           <div class="input-group">
             <label>Connection Mode</label>
             <select name="mode">
-              <option value="warp">WARP (Full Tunnel)</option>
-              <option value="doh">DNS over HTTPS (DoH)</option>
-              <option value="proxy">Local Proxy</option>
+              <option value="warp" {sel('warp')}>WARP (Full Tunnel)</option>
+              <option value="doh" {sel('doh') or sel('dns')}>DNS over HTTPS (DoH)</option>
+              <option value="proxy" {sel('proxy')}>Local Proxy</option>
             </select>
           </div>
           <button class="btn btn-primary">{icon('check',16)} Apply Mode</button>
