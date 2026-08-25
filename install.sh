@@ -30,6 +30,8 @@ fi
 clear
 echo -e "${PURPLE}===================================================${NC}"
 echo -e "${PURPLE}   WARP Enterprise Gateway & UI Setup Script       ${NC}"
+echo -e "${PURPLE}   Developer : @R47DEV      Version : 1.0.1       ${NC}"
+echo -e "${PURPLE}   https://github.com/R47DEV/warp-gateway       ${NC}"
 echo -e "${PURPLE}===================================================${NC}"
 sleep 1
 
