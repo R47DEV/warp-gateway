@@ -342,7 +342,26 @@ def detect_uplink():
     return None, None
 
 
+def ensure_firewall_nat():
+    """Ensure essential NAT and forwarding rules exist in iptables so both
+    WARP traffic and bypassed ISP traffic (out of eth0 or other physical uplink)
+    are properly masqueraded. Without masquerade on the physical interface,
+    bypassed LAN traffic encounters asymmetric routing issues or dropped packets."""
+    try:
+        run_cmd("sysctl -w net.ipv4.ip_forward=1")
+        run_cmd("iptables -t nat -C POSTROUTING -o CloudflareWARP -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o CloudflareWARP -j MASQUERADE")
+        iface, _ = detect_uplink()
+        if iface:
+            run_cmd(f"iptables -t nat -C POSTROUTING -o {iface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o {iface} -j MASQUERADE")
+        run_cmd("iptables -t nat -C POSTROUTING -m addrtype ! --dst-type LOCAL -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -m addrtype ! --dst-type LOCAL -j MASQUERADE 2>/dev/null || true")
+        run_cmd("iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT")
+        run_cmd("iptables -C FORWARD -j ACCEPT 2>/dev/null || iptables -A FORWARD -j ACCEPT")
+    except Exception:
+        pass
+
+
 def _route_apply(ip_or_cidr, iface, gateway):
+    ensure_firewall_nat()
     return run_cmd(f"ip route replace {ip_or_cidr} via {gateway} dev {iface}")
 
 
@@ -565,17 +584,28 @@ def _apply_cdn_cidrs(cidrs):
     """Install bypass routes + warp-cli entries for a list of CIDRs.
     Returns number of successfully processed routes."""
     iface, gateway = detect_uplink()
-    count = 0
+    if not iface or not gateway:
+        return 0
+    ensure_firewall_nat()
+
+    valid_cidrs = []
     for cidr in cidrs:
         try:
             ipaddress.ip_network(cidr, strict=False)
+            valid_cidrs.append(cidr)
         except ValueError:
             continue
-        warp_st_add(cidr)
-        if iface and gateway:
-            _route_apply(cidr, iface, gateway)
-        count += 1
-    return count
+
+    # Batch ip route replace commands for high-performance execution
+    batch_size = 50
+    for i in range(0, len(valid_cidrs), batch_size):
+        chunk = valid_cidrs[i:i+batch_size]
+        cmds = [f"ip route replace {c} via {gateway} dev {iface}" for c in chunk]
+        run_cmd(" ; ".join(cmds))
+        for c in chunk:
+            warp_st_add(c)
+
+    return len(valid_cidrs)
 
 
 def sync_cdn_provider(provider_key):
@@ -1532,9 +1562,9 @@ def bypass():
       <p style="font-size:12.5px;color:var(--muted);margin-bottom:8px;">🇧🇩 Quick-add Bangladesh banking &amp; fintech:</p>
       <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px;" id="presets">
         {''.join(f'<button type="button" class="preset-btn" onclick="addPreset(this)" data-val="{v}">{v}</button>'
-          for v in ['*.bkash.com','*.nagad.com.bd','*.cellfin.com.bd','*.upay.com.bd',
+          for v in ['*.bkash.com','*.bka.sh','*.nagad.com.bd','*.cellfin.com.bd','*.upay.com.bd',
                     '*.dmoney.com.bd','*.dutchbanglabank.com','*.bracbank.com',
-                    '*.ibbl.com.bd','*.tapn.com.bd','*.shohoz.com'])}
+                    '*.ibbl.com.bd','*.tapn.com.bd','*.shohoz.com','*.sslcommerz.com'])}
       </div>
       <form method="POST" action="{url_for('bypass_add')}">
         <div class="input-group">
@@ -1966,6 +1996,13 @@ def guide():
 
 
 if __name__ == "__main__":
+    # Ensure firewall NAT rules (including physical uplink interface masquerading)
+    # are in place so bypass routes work symmetrically without packet drops.
+    try:
+        ensure_firewall_nat()
+    except Exception:
+        pass
+
     # Re-install bypass routes from bypass_rules.json and re-sync WARP
     # split-tunnel entries on every service start/restart so the gateway
     # is fully configured before serving the first request.
