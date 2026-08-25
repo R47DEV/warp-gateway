@@ -1,43 +1,48 @@
+# 🛡️ WARP Gateway & Enterprise Sub-Router Engine
 
+[![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)](https://github.com/R47DEV/warp-gateway)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 
-# 🛡️ WARP Gateway & Sub-Router Engine
+**WARP Gateway** is an enterprise-grade, automated Linux installation script and web application that transforms any Ubuntu LXC Container, Virtual Machine, or Server into a dedicated Cloudflare WARP Sub-Router and Encrypted Network Gateway.
 
-**WARP Gateway** is an enterprise-grade, automated Linux installation script that transforms any Ubuntu LXC Container, Virtual Machine, or Server into a dedicated Cloudflare WARP Sub-Router and Encrypted Network Gateway. 
-
-It comes with a built-in modern, Glassmorphism-styled Web Dashboard secured with admin credentials to easily toggle Cloudflare WARP encryption **ON/OFF** for your local network traffic.
+It features a modern, Glassmorphism-styled Web Dashboard with live traffic analytics, dynamic split-tunneling for domestic banking apps, global RIR/CDN auto-sync, custom wildcard bypass rules, and one-click in-app auto-updating.
 
 ---
 
 ## 🌟 Key Features
 
-* **⚡ One-Command Installation:** Fully automated setup of Cloudflare WARP, kernel network forwarding, and firewall NAT rules.
-* **🔒 Secured Web Dashboard:** Session-based Admin Authentication protects against unauthorized access.
-* **🎨 Glassmorphism UI:** Modern, dark-themed responsive UI displaying live Public WAN IP, Gateway IP, and Connection Status.
-* **🛠️ Self-Healing Service:** Integrated `systemd` daemon that automatically recovers and restarts the service if disrupted.
-* **🔀 Sub-Router Capability:** Route traffic from any device on your Local Network (LAN) through this Gateway by simply changing their Default Gateway IP.
-* **🛡️ Non-Destructive Cleanup:** Lightweight footprint designed for clean isolated containers like Proxmox LXC.
+* **⚡ One-Command Automated Setup:** Complete automated installation of Cloudflare WARP, kernel packet forwarding, sysctl optimization, and IPTables NAT masquerading.
+* **🔒 Secured Web Dashboard:** Session-based authentication protecting the web management console (`/opt/warpgateway/credentials.json`).
+* **📊 Real-Time Traffic Routing Analytics:** Live `conntrack` inspection displaying active connection counts, byte throughput, and percentage distribution between **WARP Encrypted Tunnel** vs **Direct ISP Bypassed** traffic.
+* **🌍 National IP Auto-Bypass (240+ Countries):** Automatic real-time IPv4 allocation sync via RIPE stat for any country (e.g. BD, IN, AE, US, GB), routing domestic banking, government, and ISP traffic directly to avoid geo-blocks.
+* **☁️ Global Cloud & CDN Provider Auto-Sync:** Automated hourly sync for authoritative IP ranges across **Cloudflare CDN (Global)**, **AWS CloudFront (Global CDN)**, **AWS Asia-Pacific**, and **AWS Europe**.
+* **🔀 Custom Split-Tunneling & Wildcard Rules:** Add domains, full URLs, IPs, CIDRs, or wildcard patterns (e.g. `*.example.com`). Wildcards automatically probe common payment and API subdomains.
+* **📥 One-Click Bypass Rules Export & Backup:** Export all custom bypass rules into a clean plain-text file (`warp_gateway_bypass_rules.txt`) for one-click backup and easy re-importing.
+* **🔄 Built-In Auto-Updater & Version Checker:** Automated version checking against GitHub releases with one-click in-app updates and seamless background service restarts.
+* **🛡️ Non-Destructive Update Installer:** Installer automatically detects existing setups and preserves admin credentials and system configuration during upgrades.
+* **🛠️ Self-Healing Service:** Systemd daemon (`warpgateway.service`) with auto-restart and startup sync to ensure bypass routes survive server or WARP daemon reboots.
 
 ---
 
-## 📐 Architecture & How It Works
+## 📐 Architecture & Routing Flow
 
-
+```text
+                               ┌───► Bypassed Traffic (Banking/CDNs/National IPs) ───► Local ISP Gateway ───► Internet (Direct)
+[ LAN Devices ] ──► [ WARP Gateway ]
+(PC, TV, Phone)     (IP Forwarding & NAT)
+                               └───► International Encrypted Traffic ───────────────► Cloudflare WARP ──────► Internet (Encrypted)
 ```
 
-[ LAN Devices ] ---> [ WARP Sub-Router (This Gateway) ] ---> [ Cloudflare WARP Network ] ---> [ Internet ]
-(PC, TV, Phone)        (IP Forwarding & NAT Enabled)         (Encrypted WAN Tunnel)
-
-```
-
-1. **IP Forwarding & NAT:** The gateway routes incoming traffic from local client devices through its `CloudflareWARP` network interface using IPTables Masquerading.
-2. **One-Click Toggle:** When WARP is turned **ON** via the Web UI, all client traffic routed through this gateway is encrypted and anonymized. When turned **OFF**, traffic passes directly through standard ISP WAN routing.
+1. **Smart Packet Classification:** Incoming LAN traffic is inspected against kernel host routes and WARP split-tunnel exclusions.
+2. **Domestic & Financial Bypass:** Traffic targeting national IP blocks or enabled CDN edge ranges is routed directly via the physical uplink interface (`eth0`, `wlan0`, etc.) using NAT masquerading.
+3. **Encrypted Tunneling:** All other international internet traffic is securely encrypted and tunneled through Cloudflare WARP.
 
 ---
 
 ## 🖥️ System Requirements
 
-* **Operating System:** Ubuntu 22.04 LTS (Recommended) 
-* **Supported Environments:** Proxmox LXC Container (Privileged with TUN/TAP enabled > [Unprivieged contaner Uncheck]), KVM VM, Dedicated Server, or Raspberry Pi.
+* **Operating System:** Ubuntu 22.04 LTS (Recommended) or Debian 11/12
+* **Supported Environments:** Proxmox LXC Container (TUN/TAP enabled), KVM VM, Dedicated Server, or Raspberry Pi.
 * **Resource Footprint:** 
   * CPU: 1 Core
   * RAM: 256 MB (512 MB recommended)
@@ -47,62 +52,57 @@ It comes with a built-in modern, Glassmorphism-styled Web Dashboard secured with
 
 ## 🚀 One-Line Quick Installation
 
-Run the following command on your target Ubuntu/Debian system as `root`:
+Run the following command on your target Linux system as `root`:
 
 ```bash
-apt update && apt upgrade -y && apt install curl -y && curl -sSL [https://raw.githubusercontent.com/R47DEV/warp-gateway/main/install.sh](https://raw.githubusercontent.com/R47DEV/warp-gateway/main/install.sh) | bash
-
+apt update && apt upgrade -y && apt install curl -y && curl -sSL https://raw.githubusercontent.com/R47DEV/warp-gateway/main/install.sh | bash
 ```
 
-> **Note during installation:** The installer will prompt you to set an **Admin Username** and **Password** for accessing the Web Control Panel.
+> **Note during first installation:** The installer will prompt you to set an **Admin Username** and **Password** for accessing the Web Control Panel. Subsequent re-runs or updates automatically preserve existing credentials.
 
 ---
 
 ## 🔧 Proxmox LXC Prerequisites
 
-If installing inside a Proxmox LXC container, ensure **TUN/TAP** and **Nesting** are enabled before starting the container. Run these lines on your Proxmox Host shell:
+If installing inside a Proxmox LXC container, ensure **TUN/TAP** and **Nesting** are enabled. Add the following lines to your container configuration on the Proxmox Host shell (`/etc/pve/lxc/<CONTAINER_ID>.conf`):
 
 ```bash
 echo "lxc.cgroup2.devices.allow: c 10:200 rwm" >> /etc/pve/lxc/<CONTAINER_ID>.conf
 echo "lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file" >> /etc/pve/lxc/<CONTAINER_ID>.conf
 echo "features: nesting=1" >> /etc/pve/lxc/<CONTAINER_ID>.conf
-
 ```
 
 *(Replace `<CONTAINER_ID>` with your LXC ID, e.g., `104`)*
 
 ---
 
-## 📱 How to Use the Web Dashboard
+## 📱 Web Dashboard Overview
 
-1. After installation, access the Web Dashboard from your browser:
+After installation, open your browser and navigate to:
 ```text
 http://<GATEWAY_IP>:8080
-
 ```
 
-
-2. Log in using your configured **Admin Credentials**.
-3. **Control Status:**
-* **Turn ON WARP Gateway:** Connects to Cloudflare WARP. Your network traffic is now routed through Cloudflare's secure tunnel.
-* **Turn OFF WARP Gateway:** Disconnects WARP. Traffic routes directly via your local standard ISP connection.
-
-
+### Dashboard Tabs & Controls
+* **Dashboard:** Real-time WARP connection status, WAN/LAN IP display, live bandwidth throughput graphs, speed test, and active traffic routing analysis breakdown.
+* **Bypass Rules:** Configure **National IP Auto-Bypass**, toggle **Global CDN Provider Sync**, add custom domains/wildcards, and export rule backups.
+* **Network Info:** Detailed interfaces, WARP client account information, and connected LAN client table.
+* **Service Logs:** Embedded `journalctl` log viewer for real-time troubleshooting.
+* **Admin Settings:** Change dashboard credentials and update system preferences.
 
 ---
 
-## 🌐 Configuring Client Devices (Sub-Router Setup)
+## 🌐 Configuring LAN Client Devices (Sub-Router Setup)
 
-To route a specific device's internet traffic (e.g., Smart TV, PC, Mobile) through this WARP Gateway:
+To route client devices (Smart TVs, Mobile Phones, PCs, Gaming Consoles) through the WARP Gateway:
 
 1. Open your device's **Network Settings**.
 2. Change IP Configuration from **DHCP** to **Static**.
-3. Set the **Default Gateway / Router IP** to your **WARP Gateway IP** (e.g., your WARP Gateway web ui ip `192.168.0.222`).
-4. Set DNS to your preferred server (e.g., `1.1.1.1` or AdGuard Home IP).
+3. Set the **Default Gateway / Router IP** to your **WARP Gateway IP** (e.g. `192.168.1.222`).
+4. Set DNS to your preferred server (e.g. `1.1.1.1` or `8.8.8.8`).
 
 ---
 
 ## 📄 License
 
 Distributed under the Apache-2.0 License. See `LICENSE` for more information.
-
