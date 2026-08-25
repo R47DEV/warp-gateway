@@ -4,7 +4,7 @@
 # WARP Gateway Enterprise Installer & UI Setup
 # ==========================================
 
-set -e # Exit immediately if a command fails unexpectedly
+set -e
 
 # Formatting & Colors
 RED='\033[0;31m'
@@ -12,7 +12,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
@@ -31,9 +31,7 @@ echo -e "${PURPLE}   WARP Enterprise Gateway & UI Setup Script       ${NC}"
 echo -e "${PURPLE}===================================================${NC}"
 sleep 1
 
-# ------------------------------------------
 # 1. Dependency & Package Installation
-# ------------------------------------------
 log_info "Updating system packages and installing required dependencies..."
 apt update -y || { log_warn "Apt update failed, attempting automatic fix..."; apt update --fix-missing -y; }
 
@@ -43,9 +41,7 @@ apt install -y curl gnupg lsb-release iptables python3 python3-pip iptables-pers
 }
 log_success "Dependencies installed successfully."
 
-# ------------------------------------------
 # 2. Kernel IP Forwarding Setup
-# ------------------------------------------
 log_info "Configuring IPv4 Packet Forwarding..."
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
@@ -55,9 +51,7 @@ fi
 sysctl -p >/dev/null 2>&1 || log_warn "Minor warning during sysctl reload, continuing..."
 log_success "IP Forwarding enabled successfully."
 
-# ------------------------------------------
 # 3. Cloudflare WARP Installation
-# ------------------------------------------
 log_info "Verifying Cloudflare Repository and GPG Key..."
 mkdir -p /usr/share/keyrings
 
@@ -78,30 +72,24 @@ apt install -y cloudflare-warp || {
 # WARP Self-Recovery Registration
 log_info "Registering WARP Client..."
 warp-cli --accept-tos registration new 2>/dev/null || warp-cli --accept-tos register 2>/dev/null || log_warn "WARP is already registered or in auto-recovery mode."
-warp-cli mode warp 2>/dev/null || true
+warp-cli --accept-tos mode warp 2>/dev/null || true
 log_success "Cloudflare WARP Engine initialized."
 
-# ------------------------------------------
 # 4. NAT / Masquerade Routing Rules
-# ------------------------------------------
 log_info "Configuring IPTables Routing and NAT Rules..."
 iptables -t nat -C POSTROUTING -o CloudflareWARP -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o CloudflareWARP -j MASQUERADE
 iptables -C FORWARD -i CloudflareWARP -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i CloudflareWARP -m state --state RELATED,ESTABLISHED -j ACCEPT
 iptables -C FORWARD -j ACCEPT 2>/dev/null || iptables -A FORWARD -j ACCEPT
 
-# Save iptables rules safely
 netfilter-persistent save >/dev/null 2>&1 || log_warn "Minor warning during iptables persistence save."
 log_success "Routing Network Firewall rules applied."
 
-# ------------------------------------------
 # 5. Python Flask Web UI & Dashboard Engine
-# ------------------------------------------
 log_info "Setting up Modern Web UI Environment..."
 pip3 install flask >/dev/null 2>&1 || apt install -y python3-flask
 
 mkdir -p /opt/warpgateway
 
-# Prompt User for Admin Credentials
 echo -e "${YELLOW}---------------------------------------------------${NC}"
 echo -e "${YELLOW}   Dashboard Admin Credentials Setup               ${NC}"
 echo -e "${YELLOW}---------------------------------------------------${NC}"
@@ -118,7 +106,7 @@ ADMIN_PASS = "${UI_PASS}"
 SECRET_KEY = "$(head -c 16 /dev/urandom | hexxdump -e '16/1 "%02x"')"
 EOF
 
-# Create Application Source Code
+# Create Application Source Code (Quotes around 'EOF' prevent Bash syntax errors)
 cat << 'EOF' > /opt/warpgateway/app.py
 import subprocess
 import os
@@ -229,7 +217,7 @@ def home():
     if not session.get('logged_in'):
         return render_template_string(HTML_TEMPLATE, error=None)
     
-    status_out = run_cmd("warp-cli status")
+    status_out = run_cmd("warp-cli --accept-tos status")
     is_connected = "Connected" in status_out
     pub_ip = get_public_ip()
     gw_ip = run_cmd("hostname -I | awk '{print $1}'")
@@ -250,9 +238,9 @@ def toggle(action):
     if not session.get('logged_in'):
         return redirect(url_for('home'))
     if action == "on":
-        run_cmd("warp-cli connect")
+        run_cmd("warp-cli --accept-tos connect")
     elif action == "off":
-        run_cmd("warp-cli disconnect")
+        run_cmd("warp-cli --accept-tos disconnect")
     return redirect(url_for('home'))
 
 @app.route('/logout')
@@ -264,9 +252,7 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
 EOF
 
-# ------------------------------------------
 # 6. Systemd Self-Healing Service Setup
-# ------------------------------------------
 log_info "Configuring Auto-Start & Self-Healing Service..."
 
 cat << EOF > /etc/systemd/system/warpgateway.service
