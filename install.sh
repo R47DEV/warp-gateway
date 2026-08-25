@@ -2,6 +2,8 @@
 
 # ==========================================
 # WARP Gateway Enterprise Installer & UI Setup
+# developer : @R47DEV      Version : 1.0.1
+# https://github.com/R47DEV/warp-gateway
 # ==========================================
 
 set -e
