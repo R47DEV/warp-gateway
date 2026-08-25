@@ -77,7 +77,7 @@ apt install -y cloudflare-warp || {
 
 # WARP Self-Recovery Registration
 log_info "Registering WARP Client..."
-warp-cli registration new 2>/dev/null || warp-cli register 2>/dev/null || log_warn "WARP is already registered or in auto-recovery mode."
+warp-cli --accept-tos registration new 2>/dev/null || warp-cli --accept-tos register 2>/dev/null || log_warn "WARP is already registered or in auto-recovery mode."
 warp-cli mode warp 2>/dev/null || true
 log_success "Cloudflare WARP Engine initialized."
 
