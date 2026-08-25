@@ -488,7 +488,11 @@ def _fetch_cloudflare_cidrs():
     """Fetch Cloudflare's officially published IPv4 CIDR list."""
     try:
         import urllib.request
-        with urllib.request.urlopen("https://www.cloudflare.com/ips-v4", timeout=10) as resp:
+        req = urllib.request.Request(
+            "https://www.cloudflare.com/ips-v4",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
             return [ln.strip() for ln in resp.read().decode().splitlines() if ln.strip()]
     except Exception as exc:
         return exc
@@ -1499,7 +1503,7 @@ def bypass():
         var ta = document.getElementById('bypass-entries');
         var val = btn.getAttribute('data-val');
         var cur = ta.value.trim();
-        ta.value = cur ? cur + '\n' + val : val;
+        ta.value = cur ? cur + '\\n' + val : val;
         btn.style.opacity = '0.45';
         btn.disabled = true;
       }}
