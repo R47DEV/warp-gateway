@@ -83,7 +83,12 @@ log_success "Cloudflare WARP Engine initialized."
 # 4. NAT / Masquerade Routing Rules
 log_info "Configuring IPTables Routing and NAT Rules..."
 iptables -t nat -C POSTROUTING -o CloudflareWARP -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o CloudflareWARP -j MASQUERADE
-iptables -C FORWARD -i CloudflareWARP -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i CloudflareWARP -m state --state RELATED,ESTABLISHED -j ACCEPT
+DEFAULT_IFACE=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n 1)
+if [ -n "$DEFAULT_IFACE" ] && [ "$DEFAULT_IFACE" != "CloudflareWARP" ]; then
+    iptables -t nat -C POSTROUTING -o "$DEFAULT_IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$DEFAULT_IFACE" -j MASQUERADE
+fi
+iptables -t nat -C POSTROUTING -m addrtype ! --dst-type LOCAL -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -m addrtype ! --dst-type LOCAL -j MASQUERADE 2>/dev/null || true
+iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
 iptables -C FORWARD -j ACCEPT 2>/dev/null || iptables -A FORWARD -j ACCEPT
 
 netfilter-persistent save >/dev/null 2>&1 || log_warn "Minor warning during iptables persistence save."
