@@ -2286,11 +2286,60 @@ if __name__ == "__main__":
     except Exception:
         pass
 
+    def _startup_sync_all():
+        """Background: immediately re-sync all enabled CDN providers AND country
+        IP blocks on every service start/restart.
+
+        Why this is CRITICAL:
+        The WARP daemon clears its split-tunnel exclusion list when it restarts
+        (which happens on every `systemctl restart warpgateway`). Without this,
+        all CDN and country CIDR bypass routes are lost until the next hourly
+        sync — meaning banking apps that depend on those routes would fail for
+        up to 60 minutes after a service restart.
+        """
+        import time as _t
+        _t.sleep(3)  # Brief delay so WARP daemon is fully up before we push routes
+        try:
+            cdn = load_cdn_settings()
+            for key, prov in cdn.get("providers", {}).items():
+                if not prov.get("enabled"):
+                    continue
+                try:
+                    count, err = sync_cdn_provider(key)
+                    prov["last_sync"]  = _t.strftime("%Y-%m-%d %H:%M:%S")
+                    prov["cidr_count"] = count
+                    prov["error"]      = err
+                except Exception:
+                    pass
+            save_cdn_settings(cdn)
+        except Exception:
+            pass
+
+        try:
+            csettings = load_country_settings()
+            for code, citem in csettings.get("countries", {}).items():
+                if not citem.get("enabled"):
+                    continue
+                try:
+                    count, err = sync_country(code)
+                    citem["last_sync"]  = _t.strftime("%Y-%m-%d %H:%M:%S")
+                    citem["cidr_count"] = count
+                    citem["error"]      = err
+                except Exception:
+                    pass
+            save_country_settings(csettings)
+        except Exception:
+            pass
+
+    # Background thread 0: immediately re-sync all enabled CDN + country CIDRs
+    # so bypass routes survive service restarts (WARP daemon clears its list on restart).
+    threading.Thread(target=_startup_sync_all, daemon=True).start()
+
     # Background thread 1: re-resolves domain/wildcard rules every 3 min
     # so ip routes + warp-cli exclusions stay accurate as CDN IPs rotate.
     threading.Thread(target=bypass_refresh_loop, daemon=True).start()
 
-    # Background thread 2: syncs enabled CDN provider IP ranges every hour.
+    # Background thread 2: syncs enabled CDN provider IP ranges + country IPs every hour.
     threading.Thread(target=cdn_sync_loop, daemon=True).start()
 
     # threaded=True: toggle_warp() can block for up to a few seconds while it
@@ -2298,3 +2347,4 @@ if __name__ == "__main__":
     # freeze every other request (other users, other tabs) for the same
     # duration on Flask's single-threaded dev server.
     app.run(host="0.0.0.0", port=8080, threaded=True)
+
