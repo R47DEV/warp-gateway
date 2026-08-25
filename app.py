@@ -258,7 +258,12 @@ def _probe_warp_split_tunnel():
     global _warp_st_support
     if _warp_st_support is not None:
         return _warp_st_support
-    # Modern warp-cli (>= 2022.x) uses `warp-cli split-tunnel list`
+    # Modern Cloudflare WARP (2024+) uses `warp-cli tunnel host` / `warp-cli tunnel ip`
+    out_v3 = run_cmd("warp-cli --accept-tos tunnel host help 2>&1", timeout=5)
+    if "add" in out_v3.lower() or "list" in out_v3.lower() or "configure" in out_v3.lower():
+        _warp_st_support = "v3"
+        return _warp_st_support
+    # WARP 2022-2023 uses `warp-cli split-tunnel list`
     out = run_cmd("warp-cli --accept-tos split-tunnel list 2>&1", timeout=5)
     if out and "error" not in out.lower() and "unknown" not in out.lower() and "invalid" not in out.lower():
         _warp_st_support = "v2"
@@ -274,8 +279,12 @@ def _probe_warp_split_tunnel():
 
 def warp_st_add(target, is_host=False):
     """Add *target* to WARP split-tunnel exclusions. Returns True on success.
-    is_host=True uses --host flag so warp-cli handles all subdomains natively."""
+    is_host=True uses host exclusions so warp-cli handles all subdomains natively."""
     mode = _probe_warp_split_tunnel()
+    if mode == "v3":
+        subcmd = "host" if is_host else "ip"
+        out = run_cmd(f"warp-cli --accept-tos tunnel {subcmd} add {target} 2>&1", timeout=10)
+        return "error" not in out.lower() and "failed" not in out.lower()
     if mode == "v2":
         flag = "--host" if is_host else "--ip"
         out = run_cmd(f"warp-cli --accept-tos split-tunnel add {flag} {target} 2>&1", timeout=10)
@@ -289,7 +298,10 @@ def warp_st_add(target, is_host=False):
 def warp_st_remove(target, is_host=False):
     """Remove *target* from WARP split-tunnel exclusions (best-effort)."""
     mode = _probe_warp_split_tunnel()
-    if mode == "v2":
+    if mode == "v3":
+        subcmd = "host" if is_host else "ip"
+        run_cmd(f"warp-cli --accept-tos tunnel {subcmd} remove {target} 2>&1", timeout=10)
+    elif mode == "v2":
         flag = "--host" if is_host else "--ip"
         run_cmd(f"warp-cli --accept-tos split-tunnel remove {flag} {target} 2>&1", timeout=10)
     elif mode == "legacy" and not is_host:
@@ -299,6 +311,10 @@ def warp_st_remove(target, is_host=False):
 def warp_st_list():
     """Return raw warp-cli split-tunnel list output string (for display)."""
     mode = _probe_warp_split_tunnel()
+    if mode == "v3":
+        hosts = run_cmd("warp-cli --accept-tos tunnel host list 2>&1", timeout=5)
+        ips = run_cmd("warp-cli --accept-tos tunnel ip list 2>&1", timeout=5)
+        return f"=== Excluded Hosts ===\n{hosts}\n\n=== Excluded IPs ===\n{ips}"
     if mode == "v2":
         return run_cmd("warp-cli --accept-tos split-tunnel list 2>&1", timeout=10)
     return ""
