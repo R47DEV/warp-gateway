@@ -30,7 +30,7 @@ SERVICE_NAME         = "warpgateway"
 
 # Current running versions — must match the 'ver' file in the GitHub repo.
 APP_VERSION       = "1.0.2"
-INSTALLER_VERSION = "1.0.1"
+INSTALLER_VERSION = "1.0.2"
 
 # GitHub raw URLs used by the auto-updater
 GH_VER_URL     = "https://raw.githubusercontent.com/R47DEV/warp-gateway/refs/heads/main/ver"
@@ -3045,10 +3045,14 @@ def api_check_update():
                 remote_installer_ver = line.split(":", 1)[1].strip()
 
         def _ver_tuple(v):
-            return tuple(int(x) for x in v.split(".") if x.isdigit())
+            try:
+                return tuple(int(x) for x in str(v).replace('v', '').strip().split('.') if x.isdigit())
+            except Exception:
+                return (0, 0, 0)
 
         app_newer = _ver_tuple(remote_app_ver) > _ver_tuple(APP_VERSION)
         installer_newer = _ver_tuple(remote_installer_ver) > _ver_tuple(INSTALLER_VERSION)
+
         has_update = app_newer or installer_newer
 
         update_type = "none"
