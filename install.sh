@@ -2,7 +2,7 @@
 
 # ==========================================
 # WARP Gateway Enterprise Installer & UI Setup
-# developer : @R47DEV      Version : 1.0.1
+# developer : @R47DEV      Version : 1.0.2
 # https://github.com/R47DEV/warp-gateway
 # ==========================================
 
@@ -28,11 +28,38 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 clear
-echo -e "${PURPLE}===================================================${NC}"
-echo -e "${PURPLE}   WARP Enterprise Gateway & UI Setup Script       ${NC}"
-echo -e "${PURPLE}   Developer : @R47DEV      Version : 1.0.1       ${NC}"
-echo -e "${PURPLE}   https://github.com/R47DEV/warp-gateway       ${NC}"
-echo -e "${PURPLE}===================================================${NC}"
+
+echo -e "${PURPLE}@@@@@@@@@@@@@@@@@@@@@@@@@@@@@&GG&@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@@@@@@@@@@@@@@@@@?^^?@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#PP#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@@@@@@@@@@#B&@&PJJ@&JJP#@&B#@@@@@@@@@#?7?B@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@@@@@@@#5??#&Y!~~!&&~~~!Y&B?75B@@@@@@#J7?#@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@@@@&P7~^J@B!~~~~!&&!~~~~!B&?~~75&@@@@@@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@@@&#P5JY@#7!!!!~!&&!!!!!!J@&BB5P#@@@@@@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@#?!?Y5G@&BBBBBBBB@@BBBBB#@P77Y@&?7?#@@@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@#7~~~~~P@J~!!!!777&&777!~P@G?7Y@G~~~!#@@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@&7~~~~~!@#~~~~~~~~!&#!~~7P&GPG&@Y~~~~~7&@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@Y~~~~~~J@5~~~~~~~~!&#~?G&G?~~~P@J~~~~~~5@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@&GPB@@7!!!!!~5@Y~!!!!!!!!&&B@G?~!!!~Y@5~!!!!!?@@BPG&@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@5^^~B@BBBBBBB&@#BBBBBBBB&@@&#BBBBBBB#@#BBBBBBB@B~^^5@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@&GPB@@?!!!!!!5@Y!!!!!75&&@&7!!!!!!!!5@GJYJ?!!?@@BPG&@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@5~~~~~~J@5^~~!Y##Y7&&!~~~~~~?GBP5555GG7Y@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@&7~~~~~?@&PY5&#Y!~!&&!~~~~~?@57GGPPG7Y@&@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@#!~~~Y&GYYB@G!!!!7&&77!!!~5@^G@!~~#G^&@@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@#?!7#@J!~J@&BBBBB@@BBBBBB&@5#&P55&#5@@@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@@@&#GGBB#@G!!!!!!&&!!!!!#&777!7?77777B@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@@@@@P7!!?&#7~~~~!&&!~~~~#B:::!BGB!:::G@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@&P5P&@@@@@@#5??B&57~~!&&~~~75@B:::~#&#!:::G@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@G~~~G@@@@@@@@@&B&@&G5Y@&JYG&@@B::::7P7::::G@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@#G#@@@@@@@@@@@@@@@@@#PP#@@@@@&GPPPPPPPPPP&@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@@@@@@@@@@@@@@@@@?^^?@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@@@@@@@@@@@@@@@@@&GG&@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@${NC}"
+echo -e "${PURPLE}                                                               ${NC}"
+echo -e "${PURPLE}         WARP Enterprise Gateway & UI Setup Script             ${NC}"
+echo -e "${PURPLE}         Developer : @R47DEV      Version : 1.0.2              ${NC}"
+echo -e "${PURPLE}         https://github.com/R47DEV/warp-gateway                ${NC}"
+echo -e "${PURPLE}===============================================================${NC}"
 sleep 1
 
 # 1. Dependency & Package Installation
@@ -189,6 +216,9 @@ fi
 rm -rf /opt/warpgateway/__pycache__
 
 log_success "app.py downloaded and validated ($(wc -l < /opt/warpgateway/app.py) lines)."
+
+# Fetch logo asset if available
+curl -fsSL "https://raw.githubusercontent.com/${WARP_GATEWAY_REPO}/${WARP_GATEWAY_REF}/logo.png" -o /opt/warpgateway/logo.png 2>/dev/null || true
 
 # 6. Systemd Self-Healing Service Setup
 log_info "Configuring Auto-Start & Self-Healing Service..."
