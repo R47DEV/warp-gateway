@@ -3061,6 +3061,12 @@ def api_check_update():
         })
 
 
+def delayed_restart():
+    """Wait 2 seconds after returning HTTP response, then restart warpgateway systemd service."""
+    time.sleep(2)
+    run_cmd("systemctl restart warpgateway")
+
+
 @app.route("/api/trigger_update", methods=["POST"])
 @login_required
 def api_trigger_update():
