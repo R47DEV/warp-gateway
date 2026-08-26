@@ -29,7 +29,7 @@ SERVICE_NAME         = "warpgateway"
 
 
 # Current running versions — must match the 'ver' file in the GitHub repo.
-APP_VERSION       = "1.0.1"
+APP_VERSION       = "1.0.2"
 INSTALLER_VERSION = "1.0.1"
 
 # GitHub raw URLs used by the auto-updater
