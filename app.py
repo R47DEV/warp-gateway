@@ -970,20 +970,44 @@ def get_connection_stats():
     return stats
 
 
+def get_device_5d_request_counts():
+    """Query total logged connection requests per client IP in the last 5 days from SQLite."""
+    counts = {}
+    init_db()
+    if os.path.exists(DB_FILE):
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT client_ip, COUNT(*)
+                FROM flow_history
+                WHERE timestamp >= datetime('now', '-5 days')
+                GROUP BY client_ip
+            """)
+            for row in cursor.fetchall():
+                counts[row[0]] = row[1]
+            conn.close()
+        except Exception:
+            pass
+    return counts
+
+
 def get_connected_devices():
     """Merge ARP-known LAN devices with their live conntrack connection
-    count + tracked upload/download bytes, sorted busiest-first (by total
-    bytes, so the heaviest user of the network floats to the top)."""
+    count + 5-day logged request count from SQLite."""
     devices = get_lan_clients()
     stats = get_connection_stats()
+    req_counts = get_device_5d_request_counts()
     for d in devices:
         s = stats.get(d["ip"], {"connections": 0, "tx_bytes": 0, "rx_bytes": 0})
         d["connections"] = s["connections"]
         d["tx_bytes"] = s["tx_bytes"]
         d["rx_bytes"] = s["rx_bytes"]
         d["total_bytes"] = s["tx_bytes"] + s["rx_bytes"]
-    devices.sort(key=lambda d: d["total_bytes"], reverse=True)
+        d["req_5d"] = req_counts.get(d["ip"], 0)
+    devices.sort(key=lambda d: (d["req_5d"], d["connections"]), reverse=True)
     return devices
+
 
 
 
@@ -1530,53 +1554,74 @@ function checkForUpdate() {
   const btn = document.getElementById('ver-check-btn');
   const notif = document.getElementById('update-notif');
   if (!btn) return;
-  btn.textContent = '…';
+  btn.textContent = '⏳ Checking…';
   btn.disabled = true;
-  fetch('/api/check_update')
+  fetch('/api/check_update', { cache: 'no-store' })
     .then(r => r.json())
     .then(d => {
       btn.disabled = false;
       if (d.has_update) {
         btn.className = 'ver-update-btn';
-        btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Update!';
+        btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Update Available!';
         btn.onclick = function() { triggerUpdate(d); };
-        notif.style.display = 'block';
-        notif.innerHTML = '🚀 v' + d.remote_app_ver + ' available! Click <b>Update!</b> to install.';
+        if (notif) {
+          notif.style.display = 'block';
+          notif.style.color = '#a5c8ff';
+          notif.style.background = 'rgba(79,142,247,.15)';
+          notif.style.borderColor = 'rgba(79,142,247,.35)';
+          notif.innerHTML = '🚀 <b>New Version Available!</b><br>Installed: v' + d.local_app_ver + ' | Latest: v' + d.remote_app_ver + '<br><button class="btn btn-primary btn-sm" style="margin-top:6px;width:auto;padding:5px 12px;" onclick="triggerUpdate(' + JSON.stringify(d).replace(/"/g, '&quot;') + ')">Click Here to Install Update</button>';
+        }
+        alert('🚀 New Update Available!\n\nCurrent Version: v' + d.local_app_ver + '\nLatest GitHub Version: v' + d.remote_app_ver + '\n\nClick "Update Available!" in the sidebar to install.');
       } else {
-        notif.style.display = 'block';
-        notif.innerHTML = '✅ You are running the latest version.';
-        notif.style.color = '#86efac';
-        notif.style.background = 'rgba(34,197,94,.1)';
-        notif.style.borderColor = 'rgba(34,197,94,.3)';
-        btn.textContent = '✓ Latest';
+        if (notif) {
+          notif.style.display = 'block';
+          notif.style.color = '#86efac';
+          notif.style.background = 'rgba(34,197,94,.12)';
+          notif.style.borderColor = 'rgba(34,197,94,.3)';
+          notif.innerHTML = '✅ <b>System Up To Date</b><br>Installed: v' + d.local_app_ver + ' | Latest: v' + d.remote_app_ver;
+        }
+        btn.textContent = '✓ v' + d.local_app_ver + ' Latest';
+        alert('✅ System Up To Date!\n\nRunning Version: v' + d.local_app_ver + '\nLatest GitHub Version: v' + d.remote_app_ver + '\n\nYour gateway is running the newest release.');
         setTimeout(() => {
-          notif.style.display = 'none';
           btn.className = 'ver-check-btn';
           btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Check';
           btn.onclick = checkForUpdate;
-        }, 4000);
+        }, 5000);
       }
       if (d.error) {
-        notif.style.display = 'block';
-        notif.style.color = '#fca5a5';
-        notif.innerHTML = '⚠ ' + d.error;
+        if (notif) {
+          notif.style.display = 'block';
+          notif.style.color = '#fca5a5';
+          notif.style.background = 'rgba(239,68,68,.1)';
+          notif.style.borderColor = 'rgba(239,68,68,.3)';
+          notif.innerHTML = '⚠ ' + d.error;
+        }
         btn.textContent = 'Retry';
+        alert('⚠ Update Check Result:\n\n' + d.error);
       }
     })
-    .catch(() => {
+    .catch((err) => {
       btn.disabled = false;
-      btn.textContent = 'Error';
+      btn.textContent = 'Retry';
+      if (notif) {
+        notif.style.display = 'block';
+        notif.style.color = '#fca5a5';
+        notif.innerHTML = '⚠ Network error while contacting update server.';
+      }
+      alert('⚠ Could not contact GitHub update server. Check network connection.');
     });
 }
 
 function triggerUpdate(d) {
   if (!confirm('This will download and install the latest version, then restart the service.\n\nProceed?')) return;
   const notif = document.getElementById('update-notif');
-  notif.style.display = 'block';
-  notif.style.color = '#a5c8ff';
-  notif.style.background = 'rgba(79,142,247,.12)';
-  notif.style.borderColor = 'rgba(79,142,247,.3)';
-  notif.innerHTML = '⏳ Downloading update… please wait.';
+  if (notif) {
+    notif.style.display = 'block';
+    notif.style.color = '#a5c8ff';
+    notif.style.background = 'rgba(79,142,247,.12)';
+    notif.style.borderColor = 'rgba(79,142,247,.3)';
+    notif.innerHTML = '⏳ Downloading update… please wait.';
+  }
   fetch('/api/trigger_update', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -1585,18 +1630,27 @@ function triggerUpdate(d) {
     .then(r => r.json())
     .then(r => {
       if (r.success) {
-        notif.style.color = '#86efac';
-        notif.style.background = 'rgba(34,197,94,.1)';
-        notif.innerHTML = '✅ Update applied! Service is restarting… please refresh in 10 seconds.';
+        if (notif) {
+          notif.style.color = '#86efac';
+          notif.style.background = 'rgba(34,197,94,.1)';
+          notif.innerHTML = '✅ Update applied! Service is restarting… please refresh in 10 seconds.';
+        }
+        alert('✅ Update Applied Successfully!\n\nService is restarting now. Please refresh the page in 10 seconds.');
       } else {
-        notif.style.color = '#fca5a5';
-        notif.innerHTML = '❌ Update failed: ' + r.error;
+        if (notif) {
+          notif.style.color = '#fca5a5';
+          notif.innerHTML = '❌ Update failed: ' + r.error;
+        }
+        alert('❌ Update Failed:\n\n' + r.error);
       }
     })
     .catch(() => {
-      notif.style.color = '#86efac';
-      notif.style.background = 'rgba(34,197,94,.1)';
-      notif.innerHTML = '✅ Update signal sent! Service is restarting… please refresh in 10 seconds.';
+      if (notif) {
+        notif.style.color = '#86efac';
+        notif.style.background = 'rgba(34,197,94,.1)';
+        notif.innerHTML = '✅ Update signal sent! Service is restarting… please refresh in 10 seconds.';
+      }
+      alert('✅ Update signal sent! Service is restarting… please refresh in 10 seconds.');
     });
 }
 </script>
@@ -1658,12 +1712,14 @@ def render_device_rows(devices):
         return '<tr><td colspan="5" style="padding:10px 0;color:var(--muted);">No devices found in the ARP table yet.</td></tr>'
     rows = []
     for d in devices:
+        req_fmt = f"{d.get('req_5d', 0):,}"
+        status_badge = '<span class="badge on" style="font-size:10px;">ACTIVE</span>' if d["connections"] > 0 else '<span class="badge mode" style="font-size:10px;">IDLE</span>'
         rows.append(
-            f'<tr><td style="padding:8px 0;border-bottom:1px solid var(--border);">{d["ip"]}</td>'
+            f'<tr><td style="padding:8px 0;border-bottom:1px solid var(--border);font-weight:600;">{d["ip"]}</td>'
             f'<td style="padding:8px 0;border-bottom:1px solid var(--border);color:var(--muted);font-size:12px;">{d["mac"]}</td>'
-            f'<td style="padding:8px 0;border-bottom:1px solid var(--border);text-align:right;">{humanize_bytes(d.get("rx_bytes", 0))}</td>'
-            f'<td style="padding:8px 0;border-bottom:1px solid var(--border);text-align:right;">{humanize_bytes(d.get("tx_bytes", 0))}</td>'
-            f'<td style="padding:8px 0;border-bottom:1px solid var(--border);text-align:right;font-weight:600;">{d["connections"]}</td></tr>'
+            f'<td style="padding:8px 0;border-bottom:1px solid var(--border);text-align:right;font-weight:600;color:#a5c8ff;">{req_fmt} requests</td>'
+            f'<td style="padding:8px 0;border-bottom:1px solid var(--border);text-align:right;font-weight:600;">{d["connections"]}</td>'
+            f'<td style="padding:8px 0;border-bottom:1px solid var(--border);text-align:right;">{status_badge}</td></tr>'
         )
     return "".join(rows)
 
@@ -1727,9 +1783,11 @@ DASHBOARD_POLL_SCRIPT = """
   setInterval(refreshDashboard, 2000);
 })();
 
-/* ---- Traffic Flow Inspector Pagination & Filtering JS ---- */
+/* ---- Traffic Flow Inspector Pagination, Date & Filtering JS ---- */
 let currentFlowTab = 'live';
 let currentFlowRouteFilter = 'all';
+let currentFlowDateFilter = 'all';
+let currentFlowDateVal = '';
 let currentFlowPage = 1;
 let currentFlowPerPage = 30;
 let currentFlowSearch = '';
@@ -1749,6 +1807,26 @@ function setFlowRouteFilter(route) {
   document.querySelectorAll('.flow-rf-btn').forEach(btn => {
     btn.classList.toggle('active', btn.getAttribute('data-type') === route);
   });
+  fetchFlows();
+}
+
+function onFlowDateFilterChange() {
+  const sel = document.getElementById('flow-date-filter').value;
+  currentFlowDateFilter = sel;
+  const picker = document.getElementById('flow-custom-date-picker');
+  if (sel === 'custom') {
+    picker.style.display = 'inline-block';
+  } else {
+    picker.style.display = 'none';
+    currentFlowDateVal = '';
+    currentFlowPage = 1;
+    fetchFlows();
+  }
+}
+
+function onFlowCustomDateChange() {
+  currentFlowDateVal = document.getElementById('flow-custom-date-picker').value;
+  currentFlowPage = 1;
   fetchFlows();
 }
 
@@ -1787,7 +1865,7 @@ function nextFlowPage() {
 
 function fetchFlows() {
   const endpoint = currentFlowTab === 'live' ? '/api/connections/live' : '/api/connections/history';
-  const url = `${endpoint}?route_type=${currentFlowRouteFilter}&search=${encodeURIComponent(currentFlowSearch)}&page=${currentFlowPage}&per_page=${currentFlowPerPage}`;
+  const url = `${endpoint}?route_type=${currentFlowRouteFilter}&date_filter=${currentFlowDateFilter}&date_val=${encodeURIComponent(currentFlowDateVal)}&search=${encodeURIComponent(currentFlowSearch)}&page=${currentFlowPage}&per_page=${currentFlowPerPage}`;
 
   fetch(url, { cache: "no-store" })
     .then(r => r.json())
@@ -1961,7 +2039,7 @@ def dashboard():
         </div>
       </div>
 
-      <!-- Controls Row: Route Filter + Search + Items Per Page -->
+      <!-- Controls Row: Route Filter + Date Filter + Search + Items Per Page -->
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px;background:var(--panel-2);padding:10px 14px;border-radius:12px;border:1px solid var(--border);">
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
           <span style="font-size:12px;color:var(--muted);font-weight:600;margin-right:4px;">Filter:</span>
@@ -1969,7 +2047,20 @@ def dashboard():
           <button class="btn btn-outline btn-sm flow-rf-btn" data-type="warp" onclick="setFlowRouteFilter('warp')">WARP Encrypted</button>
           <button class="btn btn-outline btn-sm flow-rf-btn" data-type="bypass" onclick="setFlowRouteFilter('bypass')">Direct ISP Bypassed</button>
         </div>
-        <div style="display:flex;gap:10px;align-items:center;flex:1;max-width:320px;">
+
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <span style="font-size:12px;color:var(--muted);font-weight:600;">📅 Date:</span>
+          <select id="flow-date-filter" onchange="onFlowDateFilterChange()" style="padding:6px 10px;background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12px;outline:none;">
+            <option value="all" selected>All Time (Last 5 Days)</option>
+            <option value="today">Today</option>
+            <option value="yesterday">Yesterday</option>
+            <option value="24h">Last 24 Hours</option>
+            <option value="custom">Custom Date...</option>
+          </select>
+          <input type="date" id="flow-custom-date-picker" onchange="onFlowCustomDateChange()" style="display:none;padding:5px 8px;background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12px;outline:none;">
+        </div>
+
+        <div style="display:flex;gap:10px;align-items:center;flex:1;max-width:260px;">
           <input type="text" id="flow-search-input" placeholder="Search IP, Hostname, or Port..."
             oninput="onFlowSearchChange()"
             style="width:100%;padding:7px 12px;background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12.5px;outline:none;">
@@ -2032,15 +2123,15 @@ def dashboard():
 
     <div class="card">
       <h3>{icon('server')} Connected Devices <span class="badge mode" id="device-count-badge" style="margin-left:6px;">{len(devices)} devices</span></h3>
-      <p style="color:var(--muted);font-size:12px;margin-bottom:10px;">IP and MAC from the ARP table. Download/Upload and connection count are live figures from <code style="background:var(--panel-2);padding:1px 6px;border-radius:5px;">conntrack</code> (requires that package) — they reflect traffic on currently-active connections, not lifetime totals per device.</p>
+      <p style="color:var(--muted);font-size:12px;margin-bottom:10px;">Connected devices from the ARP table with total logged requests over the last 5 days and live active connections.</p>
       <table style="width:100%;border-collapse:collapse;font-size:13px;">
         <thead>
           <tr style="text-align:left;color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;">
             <th style="padding-bottom:8px;">IP Address</th>
             <th style="padding-bottom:8px;">MAC Address</th>
-            <th style="padding-bottom:8px;text-align:right;">Download</th>
-            <th style="padding-bottom:8px;text-align:right;">Upload</th>
-            <th style="padding-bottom:8px;text-align:right;">Active Connections</th>
+            <th style="padding-bottom:8px;text-align:right;">Requests (Last 5 Days)</th>
+            <th style="padding-bottom:8px;text-align:right;">Live Active Connections</th>
+            <th style="padding-bottom:8px;text-align:right;">Status</th>
           </tr>
         </thead>
         <tbody id="device-table-body">{render_device_rows(devices)}</tbody>
@@ -3097,8 +3188,10 @@ def api_connections_live():
 @login_required
 def api_connections_history():
     """Return historical log records from SQLite database with pagination,
-    route filtering, and search."""
+    route filtering, date filtering, and search."""
     route_filter = request.args.get("route_type", "all").lower()
+    date_filter = request.args.get("date_filter", "all").lower()
+    date_val = request.args.get("date_val", "").strip()
     search = request.args.get("search", "").strip().lower()
     page = int(request.args.get("page", 1) if request.args.get("page", "1").isdigit() else 1)
     per_page = int(request.args.get("per_page", 25) if request.args.get("per_page", "25").isdigit() else 25)
@@ -3121,12 +3214,23 @@ def api_connections_history():
             where_clauses.append("route_type = ?")
             params.append(route_filter)
 
+        if date_filter == "today":
+            where_clauses.append("DATE(timestamp) = DATE('now', 'localtime')")
+        elif date_filter == "yesterday":
+            where_clauses.append("DATE(timestamp) = DATE('now', '-1 day', 'localtime')")
+        elif date_filter == "24h":
+            where_clauses.append("timestamp >= datetime('now', '-24 hours')")
+        elif date_filter == "custom" and date_val:
+            where_clauses.append("DATE(timestamp) = ?")
+            params.append(date_val)
+
         if search:
             where_clauses.append("(client_ip LIKE ? OR dst_ip LIKE ? OR dst_host LIKE ? OR dport LIKE ?)")
             s_param = f"%{search}%"
             params.extend([s_param, s_param, s_param, s_param])
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
 
         # Count query
         cursor.execute(f"SELECT COUNT(*) FROM flow_history {where_sql}", params)
