@@ -853,6 +853,19 @@ def get_default_iface():
     return match.group(1) if match else None
 
 
+def get_monitored_iface():
+    """Prefer CloudflareWARP interface for accurate asymmetric WAN throughput
+    if present in /proc/net/dev, else fallback to the default route interface."""
+    try:
+        with open("/proc/net/dev") as f:
+            content = f.read()
+            if "CloudflareWARP:" in content:
+                return "CloudflareWARP"
+    except Exception:
+        pass
+    return get_default_iface()
+
+
 def get_iface_bytes(iface):
     """Total RX/TX bytes for `iface` since boot, read from /proc/net/dev."""
     if not iface:
@@ -1911,7 +1924,7 @@ def dashboard():
     gw_ip = get_gateway_ip()
     mode = get_warp_mode()
 
-    iface = get_default_iface()
+    iface = get_monitored_iface()
     rx_rate, tx_rate, rx_total, tx_total = get_throughput_nonblocking(iface)
     devices = get_connected_devices()
     tstats = get_traffic_routing_stats()
@@ -2131,7 +2144,7 @@ def api_dashboard_stats():
     needs a manual refresh."""
     connected = is_warp_connected()
     mode = get_warp_mode()
-    iface = get_default_iface()
+    iface = get_monitored_iface()
     rx_rate, tx_rate, rx_total, tx_total = get_throughput_nonblocking(iface)
     devices = get_connected_devices()
     tstats = get_traffic_routing_stats()
