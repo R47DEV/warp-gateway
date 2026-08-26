@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" width="140" alt="WARP Gateway Logo">
+  <img src="logo.png" width="240" alt="WARP Gateway Logo">
 </p>
 
 # 🛡️ WARP Gateway & Enterprise Sub-Router Engine
