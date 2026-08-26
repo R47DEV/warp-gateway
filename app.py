@@ -1552,109 +1552,81 @@ BASE = """
 <script>
 let latestVersionInfo = null;
 
+function showUpdateNotif(msg, color, bg, border) {
+  const notif = document.getElementById('update-notif');
+  if (!notif) return;
+  notif.style.display = 'block';
+  notif.style.color = color || '#c7d8f5';
+  notif.style.background = bg || 'rgba(79,142,247,.12)';
+  notif.style.borderColor = border || 'rgba(79,142,247,.3)';
+  notif.innerHTML = msg;
+}
+
 function checkForUpdate() {
   const btn = document.getElementById('ver-check-btn');
-  const notif = document.getElementById('update-notif');
   if (!btn) return;
-  btn.textContent = '⏳ Checking…';
+  btn.textContent = 'Checking...';
   btn.disabled = true;
   fetch('/api/check_update', { cache: 'no-store' })
-    .then(r => r.json())
-    .then(d => {
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
       btn.disabled = false;
       latestVersionInfo = d;
+      if (d.error) {
+        btn.textContent = 'Retry';
+        btn.onclick = checkForUpdate;
+        showUpdateNotif('Update check failed: ' + d.error, '#fca5a5', 'rgba(239,68,68,.1)', 'rgba(239,68,68,.3)');
+        return;
+      }
       if (d.has_update) {
         btn.className = 'ver-update-btn';
-        btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Update Available!';
+        btn.textContent = 'Update!';
         btn.onclick = function() { triggerUpdate(); };
-        if (notif) {
-          notif.style.display = 'block';
-          notif.style.color = '#a5c8ff';
-          notif.style.background = 'rgba(79,142,247,.15)';
-          notif.style.borderColor = 'rgba(79,142,247,.35)';
-          notif.innerHTML = '🚀 <b>New Version Available!</b><br>Installed: v' + d.local_app_ver + ' | Latest: v' + d.remote_app_ver + '<br><button class="btn btn-primary btn-sm" style="margin-top:6px;width:auto;padding:5px 12px;" onclick="triggerUpdate()">Click Here to Install Update</button>';
-        }
-        alert('🚀 New Update Available!\n\nCurrent Version: v' + d.local_app_ver + '\nLatest GitHub Version: v' + d.remote_app_ver + '\n\nClick "Update Available!" in the sidebar to install.');
+        showUpdateNotif(
+          '<b>New Version Available!</b><br>Installed: v' + d.local_app_ver + ' | Latest: v' + d.remote_app_ver + '<br><button class="btn btn-primary btn-sm" style="margin-top:6px;width:auto;padding:5px 12px;" onclick="triggerUpdate()">Install Update Now</button>',
+          '#a5c8ff', 'rgba(79,142,247,.15)', 'rgba(79,142,247,.35)'
+        );
       } else {
-        if (notif) {
-          notif.style.display = 'block';
-          notif.style.color = '#86efac';
-          notif.style.background = 'rgba(34,197,94,.12)';
-          notif.style.borderColor = 'rgba(34,197,94,.3)';
-          notif.innerHTML = '✅ <b>System Up To Date</b><br>Installed: v' + d.local_app_ver + ' | Latest: v' + d.remote_app_ver;
-        }
-        btn.textContent = '✓ v' + d.local_app_ver + ' Latest';
-        alert('✅ System Up To Date!\n\nRunning Version: v' + d.local_app_ver + '\nLatest GitHub Version: v' + d.remote_app_ver + '\n\nYour gateway is running the newest release.');
-        setTimeout(() => {
+        btn.textContent = 'Up to Date';
+        btn.onclick = checkForUpdate;
+        showUpdateNotif(
+          'System Up To Date &mdash; Installed: v' + d.local_app_ver + ' | Latest: v' + d.remote_app_ver,
+          '#86efac', 'rgba(34,197,94,.12)', 'rgba(34,197,94,.3)'
+        );
+        setTimeout(function() {
           btn.className = 'ver-check-btn';
-          btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Check';
+          btn.textContent = 'Check';
           btn.onclick = checkForUpdate;
         }, 5000);
       }
-      if (d.error) {
-        if (notif) {
-          notif.style.display = 'block';
-          notif.style.color = '#fca5a5';
-          notif.style.background = 'rgba(239,68,68,.1)';
-          notif.style.borderColor = 'rgba(239,68,68,.3)';
-          notif.innerHTML = '⚠ ' + d.error;
-        }
-        btn.textContent = 'Retry';
-        alert('⚠ Update Check Result:\n\n' + d.error);
-      }
     })
-    .catch((err) => {
+    .catch(function() {
       btn.disabled = false;
       btn.textContent = 'Retry';
-      if (notif) {
-        notif.style.display = 'block';
-        notif.style.color = '#fca5a5';
-        notif.innerHTML = '⚠ Network error while contacting update server.';
-      }
-      alert('⚠ Could not contact GitHub update server. Check network connection.');
+      btn.onclick = checkForUpdate;
+      showUpdateNotif('Network error - could not reach update server.', '#fca5a5', 'rgba(239,68,68,.1)', 'rgba(239,68,68,.3)');
     });
 }
 
 function triggerUpdate() {
   if (!latestVersionInfo) return;
-  if (!confirm('This will download and install the latest version, then restart the service.\n\nProceed?')) return;
   const notif = document.getElementById('update-notif');
-  if (notif) {
-    notif.style.display = 'block';
-    notif.style.color = '#a5c8ff';
-    notif.style.background = 'rgba(79,142,247,.12)';
-    notif.style.borderColor = 'rgba(79,142,247,.3)';
-    notif.innerHTML = '⏳ Downloading update… please wait.';
-  }
+  showUpdateNotif('Downloading update, please wait...', '#a5c8ff', 'rgba(79,142,247,.12)', 'rgba(79,142,247,.3)');
   fetch('/api/trigger_update', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({update_type: latestVersionInfo.update_type})
   })
-    .then(r => r.json())
-    .then(r => {
+    .then(function(r) { return r.json(); })
+    .then(function(r) {
       if (r.success) {
-        if (notif) {
-          notif.style.color = '#86efac';
-          notif.style.background = 'rgba(34,197,94,.1)';
-          notif.innerHTML = '✅ Update applied! Service is restarting… please refresh in 10 seconds.';
-        }
-        alert('✅ Update Applied Successfully!\n\nService is restarting now. Please refresh the page in 10 seconds.');
+        showUpdateNotif('Update applied! Service is restarting... Refresh in 10 seconds.', '#86efac', 'rgba(34,197,94,.1)', 'rgba(34,197,94,.3)');
       } else {
-        if (notif) {
-          notif.style.color = '#fca5a5';
-          notif.innerHTML = '❌ Update failed: ' + r.error;
-        }
-        alert('❌ Update Failed:\n\n' + r.error);
+        showUpdateNotif('Update failed: ' + r.error, '#fca5a5', 'rgba(239,68,68,.1)', 'rgba(239,68,68,.3)');
       }
     })
-    .catch(() => {
-      if (notif) {
-        notif.style.color = '#86efac';
-        notif.style.background = 'rgba(34,197,94,.1)';
-        notif.innerHTML = '✅ Update signal sent! Service is restarting… please refresh in 10 seconds.';
-      }
-      alert('✅ Update signal sent! Service is restarting… please refresh in 10 seconds.');
+    .catch(function() {
+      showUpdateNotif('Update signal sent! Service is restarting... Refresh in 10 seconds.', '#86efac', 'rgba(34,197,94,.1)', 'rgba(34,197,94,.3)');
     });
 }
 </script>
