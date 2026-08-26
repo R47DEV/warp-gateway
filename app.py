@@ -29,7 +29,7 @@ SERVICE_NAME         = "warpgateway"
 
 
 # Current running versions — must match the 'ver' file in the GitHub repo.
-APP_VERSION       = "1.0.2"
+APP_VERSION       = "1.0.1"
 INSTALLER_VERSION = "1.0.1"
 
 # GitHub raw URLs used by the auto-updater
@@ -1550,6 +1550,8 @@ BASE = """
 {% endif %}
 
 <script>
+let latestVersionInfo = null;
+
 function checkForUpdate() {
   const btn = document.getElementById('ver-check-btn');
   const notif = document.getElementById('update-notif');
@@ -1560,16 +1562,17 @@ function checkForUpdate() {
     .then(r => r.json())
     .then(d => {
       btn.disabled = false;
+      latestVersionInfo = d;
       if (d.has_update) {
         btn.className = 'ver-update-btn';
         btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Update Available!';
-        btn.onclick = function() { triggerUpdate(d); };
+        btn.onclick = function() { triggerUpdate(); };
         if (notif) {
           notif.style.display = 'block';
           notif.style.color = '#a5c8ff';
           notif.style.background = 'rgba(79,142,247,.15)';
           notif.style.borderColor = 'rgba(79,142,247,.35)';
-          notif.innerHTML = '🚀 <b>New Version Available!</b><br>Installed: v' + d.local_app_ver + ' | Latest: v' + d.remote_app_ver + '<br><button class="btn btn-primary btn-sm" style="margin-top:6px;width:auto;padding:5px 12px;" onclick="triggerUpdate(' + JSON.stringify(d).replace(/"/g, '&quot;') + ')">Click Here to Install Update</button>';
+          notif.innerHTML = '🚀 <b>New Version Available!</b><br>Installed: v' + d.local_app_ver + ' | Latest: v' + d.remote_app_ver + '<br><button class="btn btn-primary btn-sm" style="margin-top:6px;width:auto;padding:5px 12px;" onclick="triggerUpdate()">Click Here to Install Update</button>';
         }
         alert('🚀 New Update Available!\n\nCurrent Version: v' + d.local_app_ver + '\nLatest GitHub Version: v' + d.remote_app_ver + '\n\nClick "Update Available!" in the sidebar to install.');
       } else {
@@ -1612,7 +1615,8 @@ function checkForUpdate() {
     });
 }
 
-function triggerUpdate(d) {
+function triggerUpdate() {
+  if (!latestVersionInfo) return;
   if (!confirm('This will download and install the latest version, then restart the service.\n\nProceed?')) return;
   const notif = document.getElementById('update-notif');
   if (notif) {
@@ -1625,7 +1629,7 @@ function triggerUpdate(d) {
   fetch('/api/trigger_update', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({update_type: d.update_type})
+    body: JSON.stringify({update_type: latestVersionInfo.update_type})
   })
     .then(r => r.json())
     .then(r => {
