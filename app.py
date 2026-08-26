@@ -10,7 +10,7 @@ import time
 import sqlite3
 from functools import wraps
 from urllib.parse import urlparse
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify, send_file
 from markupsafe import Markup
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -29,7 +29,7 @@ SERVICE_NAME         = "warpgateway"
 
 
 # Current running versions — must match the 'ver' file in the GitHub repo.
-APP_VERSION       = "1.0.1"
+APP_VERSION       = "1.0.2"
 INSTALLER_VERSION = "1.0.1"
 
 # GitHub raw URLs used by the auto-updater
@@ -1460,7 +1460,10 @@ BASE = """
 {% if not session.get('logged_in') %}
   <div class="login-wrap">
     <div class="login-card">
-      <div class="login-logo">{{ icon('shield', 26) }}</div>
+      <div class="login-logo" style="background:transparent;width:68px;height:68px;margin:0 auto 18px auto;display:flex;align-items:center;justify-content:center;">
+        <img src="{{ url_for('serve_logo') }}" alt="Logo" style="width:68px;height:68px;object-fit:contain;filter:drop-shadow(0 4px 10px rgba(0,0,0,0.35));" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+        <div style="display:none;width:54px;height:54px;border-radius:14px;background:linear-gradient(135deg,var(--accent1),var(--accent2));align-items:center;justify-content:center;">{{ icon('shield', 26) }}</div>
+      </div>
       <h1>WARP Gateway</h1>
       <p class="subtitle">Enterprise Gateway Control Panel</p>
       {% with msgs = get_flashed_messages(with_categories=true) %}
@@ -1486,7 +1489,10 @@ BASE = """
   <div class="shell">
     <div class="sidebar">
       <div class="brand">
-        <div class="brand-badge">{{ icon('shield',18) }}</div>
+        <div class="brand-badge" style="background:transparent;padding:0;width:38px;height:38px;display:flex;align-items:center;justify-content:center;">
+          <img src="{{ url_for('serve_logo') }}" alt="Logo" style="width:38px;height:38px;object-fit:contain;filter:drop-shadow(0 2px 5px rgba(0,0,0,0.3));" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+          <div style="display:none;width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,var(--accent1),var(--accent2));align-items:center;justify-content:center;">{{ icon('shield',18) }}</div>
+        </div>
         <div>
           <div class="brand-title">WARP Gateway</div>
           <div class="brand-sub">Enterprise Console</div>
@@ -2998,6 +3004,17 @@ def guide():
     </div>
     """
     return render_page("guide", "Setup Guide", "Router configuration reference for this gateway", content)
+
+
+@app.route("/logo.png")
+def serve_logo():
+    """Serve the logo image file from local project directory or fallback /opt/warpgateway/logo.png."""
+    logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+    if not os.path.exists(logo_path):
+        logo_path = "/opt/warpgateway/logo.png"
+    if os.path.exists(logo_path):
+        return send_file(logo_path, mimetype="image/png")
+    return "", 404
 
 
 # ---------------------------------------------------------------------------
