@@ -7,6 +7,7 @@ import ipaddress
 import uuid
 import threading
 import time
+import sqlite3
 from functools import wraps
 from urllib.parse import urlparse
 from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
@@ -23,10 +24,12 @@ BYPASS_RULES_FILE    = "/opt/warpgateway/bypass_rules.json"
 BYPASS_SETTINGS_FILE = "/opt/warpgateway/bypass_settings.json"
 CDN_SETTINGS_FILE    = "/opt/warpgateway/cdn_settings.json"
 COUNTRY_SETTINGS_FILE = "/opt/warpgateway/country_settings.json"
+DB_FILE              = "/opt/warpgateway/traffic_history.db"
 SERVICE_NAME         = "warpgateway"
 
+
 # Current running versions — must match the 'ver' file in the GitHub repo.
-APP_VERSION       = "1.0.1"
+APP_VERSION       = "1.0.2"
 INSTALLER_VERSION = "1.0.1"
 
 # GitHub raw URLs used by the auto-updater
@@ -985,29 +988,177 @@ def get_connected_devices():
 
 
 # ---------------------------------------------------------------------------
+# SQLite Traffic History Database & DNS Reverse Lookup Engine
+# ---------------------------------------------------------------------------
+_dns_cache = {}
+_dns_cache_lock = threading.Lock()
+
+
+def resolve_ip_to_host(ip_str):
+    """Fast reverse-DNS and domain map lookup with in-memory thread-safe caching."""
+    if not ip_str or ip_str == "127.0.0.1":
+        return ip_str or "Unknown"
+
+    with _dns_cache_lock:
+        if ip_str in _dns_cache:
+            return _dns_cache[ip_str]
+
+    # 1. Match against active custom bypass rules
+    for rule in load_bypass_rules():
+        if ip_str in rule.get("resolved_ips", []):
+            host_val = f"*.{rule['value']}" if rule.get("type") == "wildcard" else rule.get("value")
+            with _dns_cache_lock:
+                _dns_cache[ip_str] = host_val
+            return host_val
+
+    # 2. Try socket reverse DNS (PTR lookup) with short fallback
+    try:
+        host, _, _ = socket.gethostbyaddr(ip_str)
+        with _dns_cache_lock:
+            _dns_cache[ip_str] = host
+        return host
+    except Exception:
+        with _dns_cache_lock:
+            _dns_cache[ip_str] = ip_str
+        return ip_str
+
+
+def init_db():
+    """Ensure SQLite traffic history table and indexes exist."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS flow_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                client_ip TEXT,
+                dst_ip TEXT,
+                dst_host TEXT,
+                dport INTEGER,
+                proto TEXT,
+                route_type TEXT,
+                bytes INTEGER
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON flow_history(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_route ON flow_history(route_type)")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def get_active_conntrack_flows():
+    """Parse netfilter conntrack table into detailed flow objects."""
+    iface, _gw = detect_uplink()
+    bypass_nets = set()
+
+    if iface:
+        route_out = run_cmd(f"ip route show dev {iface}")
+        for line in route_out.splitlines():
+            parts = line.strip().split()
+            if parts:
+                try:
+                    bypass_nets.add(ipaddress.ip_network(parts[0], strict=False))
+                except ValueError:
+                    pass
+
+    for rule in load_bypass_rules():
+        for ip_str in rule.get("resolved_ips", []):
+            try:
+                bypass_nets.add(ipaddress.ip_network(ip_str, strict=False))
+            except ValueError:
+                pass
+
+    out = run_cmd("conntrack -L -n 2>/dev/null")
+    flows = []
+
+    for line in out.splitlines():
+        srcs = re.findall(r"\bsrc=(\d+\.\d+\.\d+\.\d+)", line)
+        dsts = re.findall(r"\bdst=(\d+\.\d+\.\d+\.\d+)", line)
+        dports = re.findall(r"\bdport=(\d+)", line)
+        byte_counts = re.findall(r"\bbytes=(\d+)", line)
+
+        if not srcs or not dsts:
+            continue
+
+        client_ip = srcs[0]
+        dst_ip = dsts[0]
+        dport = int(dports[0]) if dports else 0
+        proto = "TCP" if "tcp" in line.lower() else ("UDP" if "udp" in line.lower() else "IP")
+        total_bytes = sum(int(b) for b in byte_counts)
+
+        try:
+            addr = ipaddress.ip_address(dst_ip)
+            is_bypass = any(addr in net for net in bypass_nets)
+        except ValueError:
+            is_bypass = False
+
+        route_type = "bypass" if is_bypass else "warp"
+        dst_host = resolve_ip_to_host(dst_ip)
+
+        flows.append({
+            "client_ip": client_ip,
+            "dst_ip": dst_ip,
+            "dst_host": dst_host,
+            "dport": dport,
+            "proto": proto,
+            "route_type": route_type,
+            "bytes": total_bytes,
+            "bytes_human": humanize_bytes(total_bytes)
+        })
+
+    # Sort heaviest traffic first
+    flows.sort(key=lambda f: f["bytes"], reverse=True)
+    return flows
+
+
+def traffic_history_loop(interval=60):
+    """Background thread: logs active traffic flows to SQLite and automatically
+    purges history records older than 5 days."""
+    init_db()
+    while True:
+        time.sleep(interval)
+        try:
+            flows = get_active_conntrack_flows()
+            if flows and os.path.exists(DB_FILE):
+                conn = sqlite3.connect(DB_FILE)
+                cursor = conn.cursor()
+                now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+                # Record top 100 active flows
+                records = [
+                    (now_str, f["client_ip"], f["dst_ip"], f["dst_host"], f["dport"], f["proto"], f["route_type"], f["bytes"])
+                    for f in flows[:100]
+                ]
+                cursor.executemany("""
+                    INSERT INTO flow_history (timestamp, client_ip, dst_ip, dst_host, dport, proto, route_type, bytes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, records)
+
+                # Purge history older than 5 days
+                cursor.execute("DELETE FROM flow_history WHERE timestamp < datetime('now', '-5 days')")
+                conn.commit()
+                conn.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Traffic routing analysis: bypass vs WARP-encrypted connections
 # ---------------------------------------------------------------------------
 def get_traffic_routing_stats():
     """Analyse the conntrack table to count active connections split by routing
-    path: WARP-encrypted tunnel vs direct ISP bypass.
-
-    Heuristic: a connection is 'bypassed' if its destination IP falls within
-    any ip route that exits via the physical ISP uplink interface (not
-    CloudflareWARP). All other connections are assumed to traverse the WARP
-    encrypted tunnel.
-
-    Returns a dict with keys:
-        warp_connections    - int, connections going through WARP tunnel
-        bypass_connections  - int, connections going via direct ISP route
-        total_connections   - int, sum of all active conntrack entries
-        active_bypass_routes - int, distinct CIDR blocks currently bypassed
-        bypass_bytes_total  - int, raw bytes tracked for bypassed flows
-        warp_bytes_total    - int, raw bytes tracked for WARP-tunnelled flows
-    """
+    path: WARP-encrypted tunnel vs direct ISP bypass."""
     try:
+        flows = get_active_conntrack_flows()
+        warp_connections = sum(1 for f in flows if f["route_type"] == "warp")
+        bypass_connections = sum(1 for f in flows if f["route_type"] == "bypass")
+        warp_bytes = sum(f["bytes"] for f in flows if f["route_type"] == "warp")
+        bypass_bytes = sum(f["bytes"] for f in flows if f["route_type"] == "bypass")
+
         iface, _gw = detect_uplink()
         bypass_nets = set()
-
         if iface:
             route_out = run_cmd(f"ip route show dev {iface}")
             for line in route_out.splitlines():
@@ -1018,43 +1169,11 @@ def get_traffic_routing_stats():
                     except ValueError:
                         pass
 
-        active_bypass_routes = len(bypass_nets)
-
-        # Also include IPs resolved for domain-based custom rules.
-        for rule in load_bypass_rules():
-            for ip_str in rule.get("resolved_ips", []):
-                try:
-                    bypass_nets.add(ipaddress.ip_network(ip_str, strict=False))
-                except ValueError:
-                    pass
-
-        out = run_cmd("conntrack -L -n 2>/dev/null")
-        warp_connections = bypass_connections = warp_bytes = bypass_bytes = 0
-
-        for line in out.splitlines():
-            dst_matches = re.findall(r"\bdst=(\d+\.\d+\.\d+\.\d+)", line)
-            byte_counts  = re.findall(r"\bbytes=(\d+)", line)
-            if not dst_matches:
-                continue
-            total_line_bytes = sum(int(b) for b in byte_counts)
-            try:
-                addr = ipaddress.ip_address(dst_matches[0])
-                is_bypass = any(addr in net for net in bypass_nets)
-            except ValueError:
-                is_bypass = False
-
-            if is_bypass:
-                bypass_connections += 1
-                bypass_bytes += total_line_bytes
-            else:
-                warp_connections += 1
-                warp_bytes += total_line_bytes
-
         return {
             "warp_connections":     warp_connections,
             "bypass_connections":   bypass_connections,
-            "total_connections":    warp_connections + bypass_connections,
-            "active_bypass_routes": active_bypass_routes,
+            "total_connections":    len(flows),
+            "active_bypass_routes": len(bypass_nets),
             "bypass_bytes_total":   bypass_bytes,
             "warp_bytes_total":     warp_bytes,
         }
@@ -1063,6 +1182,7 @@ def get_traffic_routing_stats():
             "warp_connections": 0, "bypass_connections": 0, "total_connections": 0,
             "active_bypass_routes": 0, "bypass_bytes_total": 0, "warp_bytes_total": 0,
         }
+
 
 
 # ---------------------------------------------------------------------------
@@ -1563,7 +1683,7 @@ DASHBOARD_POLL_SCRIPT = """
       document.getElementById('rx-rate').textContent = d.rx_rate_human;
       document.getElementById('tx-rate').textContent = d.tx_rate_human;
       document.getElementById('data-total').textContent =
-        'Total since boot — RX ' + d.rx_total_human + ', TX ' + d.tx_total_human;
+        'Total since boot — Download: ' + d.rx_total_human + ' | Upload: ' + d.tx_total_human;
 
       const dot = document.getElementById('warp-status-dot');
       const label = document.getElementById('warp-status-label');
@@ -1606,6 +1726,118 @@ DASHBOARD_POLL_SCRIPT = """
   refreshDashboard();
   setInterval(refreshDashboard, 2000);
 })();
+
+/* ---- Traffic Flow Inspector Pagination & Filtering JS ---- */
+let currentFlowTab = 'live';
+let currentFlowRouteFilter = 'all';
+let currentFlowPage = 1;
+let currentFlowPerPage = 30;
+let currentFlowSearch = '';
+let flowSearchTimer = null;
+
+function switchFlowTab(tab) {
+  currentFlowTab = tab;
+  currentFlowPage = 1;
+  document.getElementById('tab-live-btn').style.background = tab === 'live' ? 'var(--panel-2)' : 'transparent';
+  document.getElementById('tab-hist-btn').style.background = tab === 'history' ? 'var(--panel-2)' : 'transparent';
+  fetchFlows();
+}
+
+function setFlowRouteFilter(route) {
+  currentFlowRouteFilter = route;
+  currentFlowPage = 1;
+  document.querySelectorAll('.flow-rf-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('data-type') === route);
+  });
+  fetchFlows();
+}
+
+function openFlowModal(routeFilter) {
+  setFlowRouteFilter(routeFilter);
+  const card = document.getElementById('flow-inspector-card');
+  if (card) card.scrollIntoView({ behavior: 'smooth' });
+}
+
+function onFlowSearchChange() {
+  clearTimeout(flowSearchTimer);
+  flowSearchTimer = setTimeout(() => {
+    currentFlowSearch = document.getElementById('flow-search-input').value.trim();
+    currentFlowPage = 1;
+    fetchFlows();
+  }, 300);
+}
+
+function changeFlowPerPage() {
+  currentFlowPerPage = parseInt(document.getElementById('flow-per-page-select').value);
+  currentFlowPage = 1;
+  fetchFlows();
+}
+
+function prevFlowPage() {
+  if (currentFlowPage > 1) {
+    currentFlowPage--;
+    fetchFlows();
+  }
+}
+
+function nextFlowPage() {
+  currentFlowPage++;
+  fetchFlows();
+}
+
+function fetchFlows() {
+  const endpoint = currentFlowTab === 'live' ? '/api/connections/live' : '/api/connections/history';
+  const url = `${endpoint}?route_type=${currentFlowRouteFilter}&search=${encodeURIComponent(currentFlowSearch)}&page=${currentFlowPage}&per_page=${currentFlowPerPage}`;
+
+  fetch(url, { cache: "no-store" })
+    .then(r => r.json())
+    .then(d => {
+      currentFlowPage = d.page;
+      document.getElementById('flow-cur-page').textContent = d.page;
+      document.getElementById('flow-tot-pages').textContent = d.total_pages;
+      document.getElementById('flow-total-count-lbl').textContent = `Total: ${d.total} entries`;
+
+      document.getElementById('flow-prev-btn').disabled = (d.page <= 1);
+      document.getElementById('flow-next-btn').disabled = (d.page >= d.total_pages);
+
+      const tbody = document.getElementById('flow-table-body');
+      if (!d.flows || d.flows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="padding:16px 0;text-align:center;color:var(--muted);">No matching connection flows found.</td></tr>';
+        return;
+      }
+
+      let html = '';
+      d.flows.forEach(f => {
+        const isBypass = (f.route_type === 'bypass');
+        const badgeCls = isBypass ? 'on' : 'mode';
+        const badgeText = isBypass ? 'ISP DIRECT BYPASS' : 'WARP ENCRYPTED';
+        const timeOrState = f.timestamp ? f.timestamp : '<span style="color:var(--green);font-size:10.5px;">● ACTIVE</span>';
+        const hostDisp = (f.dst_host && f.dst_host !== f.dst_ip)
+          ? `<strong style="color:#dbe4f3;">${f.dst_host}</strong><br><span style="font-size:11px;color:var(--muted);">${f.dst_ip}</span>`
+          : `<span style="color:#dbe4f3;">${f.dst_ip}</span>`;
+
+        html += `
+          <tr style="border-bottom:1px solid var(--border);">
+            <td style="padding:7px 0;color:var(--muted);font-size:11.5px;">${timeOrState}</td>
+            <td style="padding:7px 0;font-weight:600;">${f.client_ip}</td>
+            <td style="padding:7px 0;">${hostDisp}</td>
+            <td style="padding:7px 0;color:var(--muted);font-size:11.5px;">:${f.dport} <span class="badge mode" style="font-size:9.5px;">${f.proto}</span></td>
+            <td style="padding:7px 0;text-align:right;font-weight:600;">${f.bytes_human}</td>
+            <td style="padding:7px 0;text-align:right;"><span class="badge ${badgeCls}">${badgeText}</span></td>
+          </tr>
+        `;
+      });
+      tbody.innerHTML = html;
+    })
+    .catch(() => {
+      const tbody = document.getElementById('flow-table-body');
+      if (tbody) tbody.innerHTML = '<tr><td colspan="6" style="padding:16px 0;text-align:center;color:var(--red);">Error loading connections.</td></tr>';
+    });
+}
+
+// Initial fetch on page load
+document.addEventListener('DOMContentLoaded', fetchFlows);
+setTimeout(fetchFlows, 800);
 </script>
 """
 
@@ -1671,7 +1903,7 @@ def dashboard():
             <div class="stat-big" id="tx-rate">{humanize_bytes(tx_rate)}/s</div>
           </div>
         </div>
-        <div class="stat-sub" style="margin-top:12px;" id="data-total">Total since boot — RX {humanize_bytes(rx_total)}, TX {humanize_bytes(tx_total)}</div>
+        <div class="stat-sub" style="margin-top:12px;" id="data-total">Total since boot — Download: {humanize_bytes(rx_total)} | Upload: {humanize_bytes(tx_total)}</div>
       </div>
     </div>
 
@@ -1679,15 +1911,15 @@ def dashboard():
     <div class="card" style="margin-bottom:20px;">
       <h3>{icon('zap')} Traffic Routing Analysis <span style="font-weight:400;color:var(--muted);font-size:11.5px;margin-left:8px;">Live conntrack inspection &amp; active route state</span></h3>
       <div class="traffic-grid">
-        <div class="tstat tw">
+        <div class="tstat tw" onclick="openFlowModal('warp')" style="cursor:pointer;" title="Click to inspect WARP encrypted flows">
           <div class="ts-lbl">WARP Encrypted</div>
           <div class="ts-val" id="tstat-warp">{tstats['warp_connections']}</div>
-          <div class="ts-sub">Active connections</div>
+          <div class="ts-sub">Active connections 🔍</div>
         </div>
-        <div class="tstat tb">
+        <div class="tstat tb" onclick="openFlowModal('bypass')" style="cursor:pointer;" title="Click to inspect direct ISP bypassed flows">
           <div class="ts-lbl">Direct ISP Bypassed</div>
           <div class="ts-val" id="tstat-bypass">{tstats['bypass_connections']}</div>
-          <div class="ts-sub">Active connections</div>
+          <div class="ts-sub">Active connections 🔍</div>
         </div>
         <div class="tstat tn">
           <div class="ts-lbl">Active Bypass CIDRs</div>
@@ -1713,6 +1945,72 @@ def dashboard():
           <div class="tbar-track">
             <div class="tbar-fill tb" id="tbar-bypass-fill" style="width:{bypass_pct}%;"></div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Traffic Flow Inspector Card (Live Flows & 5-Day Log History) -->
+    <div id="flow-inspector-card" class="card" style="margin-bottom:20px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px;">
+        <h3 style="margin-bottom:0;">{icon('activity')} Traffic Flow Inspector
+          <span style="font-size:11.5px;font-weight:400;color:var(--muted);margin-left:8px;">Live flows &amp; 5-day history logs with pagination</span>
+        </h3>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="btn btn-outline btn-sm" id="tab-live-btn" onclick="switchFlowTab('live')" style="background:var(--panel-2);">⚡ Live Active Flows</button>
+          <button class="btn btn-outline btn-sm" id="tab-hist-btn" onclick="switchFlowTab('history')">📜 5-Day Log History</button>
+        </div>
+      </div>
+
+      <!-- Controls Row: Route Filter + Search + Items Per Page -->
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px;background:var(--panel-2);padding:10px 14px;border-radius:12px;border:1px solid var(--border);">
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+          <span style="font-size:12px;color:var(--muted);font-weight:600;margin-right:4px;">Filter:</span>
+          <button class="btn btn-outline btn-sm flow-rf-btn active" data-type="all" onclick="setFlowRouteFilter('all')">All</button>
+          <button class="btn btn-outline btn-sm flow-rf-btn" data-type="warp" onclick="setFlowRouteFilter('warp')">WARP Encrypted</button>
+          <button class="btn btn-outline btn-sm flow-rf-btn" data-type="bypass" onclick="setFlowRouteFilter('bypass')">Direct ISP Bypassed</button>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;flex:1;max-width:320px;">
+          <input type="text" id="flow-search-input" placeholder="Search IP, Hostname, or Port..."
+            oninput="onFlowSearchChange()"
+            style="width:100%;padding:7px 12px;background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12.5px;outline:none;">
+        </div>
+      </div>
+
+      <!-- Flows Table -->
+      <div style="overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;font-size:12.5px;">
+          <thead>
+            <tr style="text-align:left;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);">
+              <th style="padding:8px 0;">Time / State</th>
+              <th style="padding:8px 0;">Client IP</th>
+              <th style="padding:8px 0;">Destination IP / Hostname</th>
+              <th style="padding:8px 0;">Port / Proto</th>
+              <th style="padding:8px 0;text-align:right;">Traffic</th>
+              <th style="padding:8px 0;text-align:right;">Routing Path</th>
+            </tr>
+          </thead>
+          <tbody id="flow-table-body">
+            <tr><td colspan="6" style="padding:16px 0;text-align:center;color:var(--muted);">Loading connection flows...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Pagination Footer -->
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px;padding-top:12px;border-top:1px solid var(--border);flex-wrap:wrap;gap:10px;font-size:12px;color:var(--muted);">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span>Per page:</span>
+          <select id="flow-per-page-select" onchange="changeFlowPerPage()" style="padding:4px 8px;background:var(--panel-2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;">
+            <option value="20">20</option>
+            <option value="30" selected>30</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+          <span id="flow-total-count-lbl" style="margin-left:8px;">Total: 0 entries</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <button class="btn btn-outline btn-sm" id="flow-prev-btn" onclick="prevFlowPage()">← Prev</button>
+          <span style="font-weight:600;color:var(--text);">Page <span id="flow-cur-page">1</span> of <span id="flow-tot-pages">1</span></span>
+          <button class="btn btn-outline btn-sm" id="flow-next-btn" onclick="nextFlowPage()">Next →</button>
         </div>
       </div>
     </div>
@@ -2748,6 +3046,137 @@ def api_trigger_update():
         return jsonify({"success": False, "error": str(exc)})
 
 
+@app.route("/api/connections/live")
+@login_required
+def api_connections_live():
+    """Return real-time active connections parsed from conntrack with pagination,
+    route filtering, and search."""
+    route_filter = request.args.get("route_type", "all").lower()
+    search = request.args.get("search", "").strip().lower()
+    page = int(request.args.get("page", 1) if request.args.get("page", "1").isdigit() else 1)
+    per_page = int(request.args.get("per_page", 25) if request.args.get("per_page", "25").isdigit() else 25)
+    if page < 1: page = 1
+    if per_page < 10: per_page = 10
+    if per_page > 100: per_page = 100
+
+    flows = get_active_conntrack_flows()
+
+    # Filter by route_type
+    if route_filter in ("warp", "bypass"):
+        flows = [f for f in flows if f["route_type"] == route_filter]
+
+    # Filter by search term
+    if search:
+        flows = [
+            f for f in flows
+            if search in f["client_ip"].lower()
+            or search in f["dst_ip"].lower()
+            or search in f["dst_host"].lower()
+            or search in str(f["dport"])
+        ]
+
+    total = len(flows)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    if page > total_pages:
+        page = total_pages
+
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_flows = flows[start:end]
+
+    return jsonify({
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+        "flows": page_flows
+    })
+
+
+@app.route("/api/connections/history")
+@login_required
+def api_connections_history():
+    """Return historical log records from SQLite database with pagination,
+    route filtering, and search."""
+    route_filter = request.args.get("route_type", "all").lower()
+    search = request.args.get("search", "").strip().lower()
+    page = int(request.args.get("page", 1) if request.args.get("page", "1").isdigit() else 1)
+    per_page = int(request.args.get("per_page", 25) if request.args.get("per_page", "25").isdigit() else 25)
+    if page < 1: page = 1
+    if per_page < 10: per_page = 10
+    if per_page > 100: per_page = 100
+
+    init_db()
+    if not os.path.exists(DB_FILE):
+        return jsonify({"total": 0, "page": 1, "per_page": per_page, "total_pages": 1, "flows": []})
+
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
+        where_clauses = []
+        params = []
+
+        if route_filter in ("warp", "bypass"):
+            where_clauses.append("route_type = ?")
+            params.append(route_filter)
+
+        if search:
+            where_clauses.append("(client_ip LIKE ? OR dst_ip LIKE ? OR dst_host LIKE ? OR dport LIKE ?)")
+            s_param = f"%{search}%"
+            params.extend([s_param, s_param, s_param, s_param])
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        # Count query
+        cursor.execute(f"SELECT COUNT(*) FROM flow_history {where_sql}", params)
+        total = cursor.fetchone()[0]
+
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        if page > total_pages:
+            page = total_pages
+
+        offset = (page - 1) * per_page
+
+        # Records query
+        query_sql = f"""
+            SELECT id, timestamp, client_ip, dst_ip, dst_host, dport, proto, route_type, bytes
+            FROM flow_history
+            {where_sql}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+        """
+        cursor.execute(query_sql, params + [per_page, offset])
+        rows = cursor.fetchall()
+        conn.close()
+
+        flows = [
+            {
+                "id": r[0],
+                "timestamp": r[1],
+                "client_ip": r[2],
+                "dst_ip": r[3],
+                "dst_host": r[4],
+                "dport": r[5],
+                "proto": r[6],
+                "route_type": r[7],
+                "bytes": r[8],
+                "bytes_human": humanize_bytes(r[8])
+            }
+            for r in rows
+        ]
+
+        return jsonify({
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+            "flows": flows
+        })
+    except Exception as exc:
+        return jsonify({"total": 0, "page": 1, "per_page": per_page, "total_pages": 1, "flows": [], "error": str(exc)})
+
+
 if __name__ == "__main__":
     # Ensure firewall NAT rules (including physical uplink interface masquerading)
     # are in place so bypass routes work symmetrically without packet drops.
@@ -2766,15 +3195,7 @@ if __name__ == "__main__":
 
     def _startup_sync_all():
         """Background: immediately re-sync all enabled CDN providers AND country
-        IP blocks on every service start/restart.
-
-        Why this is CRITICAL:
-        The WARP daemon clears its split-tunnel exclusion list when it restarts
-        (which happens on every `systemctl restart warpgateway`). Without this,
-        all CDN and country CIDR bypass routes are lost until the next hourly
-        sync — meaning banking apps that depend on those routes would fail for
-        up to 60 minutes after a service restart.
-        """
+        IP blocks on every service start/restart."""
         import time as _t
         _t.sleep(3)  # Brief delay so WARP daemon is fully up before we push routes
         try:
@@ -2810,19 +3231,17 @@ if __name__ == "__main__":
             pass
 
     # Background thread 0: immediately re-sync all enabled CDN + country CIDRs
-    # so bypass routes survive service restarts (WARP daemon clears its list on restart).
     threading.Thread(target=_startup_sync_all, daemon=True).start()
 
     # Background thread 1: re-resolves domain/wildcard rules every 3 min
-    # so ip routes + warp-cli exclusions stay accurate as CDN IPs rotate.
     threading.Thread(target=bypass_refresh_loop, daemon=True).start()
 
     # Background thread 2: syncs enabled CDN provider IP ranges + country IPs every hour.
     threading.Thread(target=cdn_sync_loop, daemon=True).start()
 
-    # threaded=True: toggle_warp() can block for up to a few seconds while it
-    # waits for the WARP daemon to settle. Without threading, that would
-    # freeze every other request (other users, other tabs) for the same
-    # duration on Flask's single-threaded dev server.
+    # Background thread 3: samples active conntrack flows and logs 5-day traffic history to SQLite.
+    threading.Thread(target=traffic_history_loop, daemon=True).start()
+
     app.run(host="0.0.0.0", port=8080, threaded=True)
+
 
